@@ -8,6 +8,9 @@
 #import <objc/runtime.h>
 #import <IOKit/IOKitLib.h>
 #import <dlfcn.h>
+#import <xpc/xpc.h>
+
+static void *VDMSkyLightHandle(void);
 
 // Compatibility for older SDKs
 #ifndef kIOMainPortDefault
@@ -27,6 +30,7 @@ static id _windowObserver = nil;
     NSArray *_modesArray;
     NSString *_displayName;
     CGDirectDisplayID _currentDisplayID;
+    BOOL _dockRepairInFlight;
 }
 @end
 
@@ -393,7 +397,37 @@ BOOL VDMNativePixelSize(CGDirectDisplayID displayID, size_t *outWidth, size_t *o
     return found;
 }
 
-/// Pick the mode to pin the physical panel to before mirroring.
+// A VRR mode reports its maximum refresh rate through CoreGraphics, so fixed
+// 60 Hz and 48–60 Hz can have identical public rates and IO flags. Resolve the
+// per-mode SkyLight query at runtime; missing symbols keep the legacy choice.
+typedef bool (*SLModeVRRQueryFn)(CGDirectDisplayID, uint32_t);
+
+static NSInteger VDMModeVariableRefreshState(CGDirectDisplayID displayID, CGDisplayModeRef mode) {
+    if (!mode) return -1;
+    static SLModeVRRQueryFn query = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *handle = VDMSkyLightHandle();
+        if (handle) query = (SLModeVRRQueryFn)dlsym(handle, "SLSIsDisplayModeVRR");
+    });
+    return query ? (query(displayID, CGDisplayModeGetIODisplayModeID(mode)) ? 1 : 0) : -1;
+}
+
+NSInteger VDMVariableRefreshState(CGDirectDisplayID displayID) {
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
+    NSInteger state = VDMModeVariableRefreshState(displayID, mode);
+    if (mode) CGDisplayModeRelease(mode);
+    return state;
+}
+
+/// Fixed modes win ties; unknown metadata preserves enumeration order.
+static NSInteger VDMRefreshPreference(CGDirectDisplayID displayID, CGDisplayModeRef mode) {
+    if (!mode) return 3;
+    NSInteger state = VDMModeVariableRefreshState(displayID, mode);
+    return state < 0 ? 1 : (state == 0 ? 0 : 2);
+}
+
+/// Pick a native physical-output mode independently of the mirror's desktop size.
 ///
 /// Resolution wins over refresh rate. Pinning below the native pixel grid to
 /// hit a requested rate makes the monitor rescale everything the mirror sends
@@ -425,29 +459,34 @@ static CGDisplayModeRef CopyBestModeAtRate(CGDirectDisplayID displayID, double r
     for (CFIndex i = 0; i < count; i++) {
         CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
         if (!CGDisplayModeIsUsableForDesktopGUI(mode)) continue;
-        // Only ever pin a one-to-one mode. Handing the panel a HiDPI duplicate
-        // would put it in a scaled desktop mode, which is what we are trying to
-        // avoid in the first place.
+        size_t pw = CGDisplayModeGetPixelWidth(mode);
+        size_t ph = CGDisplayModeGetPixelHeight(mode);
+        // Keep the physical target in a one-to-one native mode. With a larger
+        // HiDPI mirror source, a 2x physical mode clipped ordinary and text
+        // cursors on the QN990F. The source still owns the HiDPI desktop.
         if (!VDMIsOneToOne(mode)) continue;
 
         double rate = CGDisplayModeGetRefreshRate(mode);
         BOOL rateMatches = fabs(rate - refreshRate) <= 0.5;
 
-        size_t pw = CGDisplayModeGetPixelWidth(mode);
-        size_t ph = CGDisplayModeGetPixelHeight(mode);
-
         if (haveNative && pw == nativeW && ph == nativeH) {
-            if (rateMatches && !nativeAtRate) nativeAtRate = mode;
+            if (rateMatches && VDMRefreshPreference(displayID, mode) < VDMRefreshPreference(displayID, nativeAtRate)) {
+                nativeAtRate = mode;
+            }
             // nativeFastestRate is seeded at -1, so a panel that reports 0 Hz
             // for its native timing still lands here rather than falling
             // through to a smaller mode.
-            if (rate > nativeFastestRate) {
+            if (rate > nativeFastestRate ||
+                (fabs(rate - nativeFastestRate) < 0.01 &&
+                 VDMRefreshPreference(displayID, mode) < VDMRefreshPreference(displayID, nativeFastest))) {
                 nativeFastestRate = rate;
                 nativeFastest = mode;
             }
         }
 
-        if (rateMatches && pw * ph > anyAtRatePixels) {
+        if (rateMatches && (pw * ph > anyAtRatePixels ||
+            (pw * ph == anyAtRatePixels &&
+             VDMRefreshPreference(displayID, mode) < VDMRefreshPreference(displayID, anyAtRate)))) {
             anyAtRatePixels = pw * ph;
             anyAtRate = mode;
         }
@@ -466,6 +505,11 @@ static CGDisplayModeRef CopyBestModeAtRate(CGDirectDisplayID displayID, double r
         best = anyAtRate;
     }
 
+    if (best) {
+        NSLog(@"VDM: Native pin selected mode %u, refresh policy: %@",
+              CGDisplayModeGetIODisplayModeID(best),
+              VDMRefreshPreference(displayID, best) == 0 ? @"fixed (VRR off)" : @"VRR or unknown");
+    }
     CGDisplayModeRef retained = best ? (CGDisplayModeRef)CGDisplayModeRetain(best) : NULL;
     CFRelease(modes);
     return retained;
@@ -494,6 +538,42 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
     NSLog(@"VDM: Restored target %u to original mode after failed mirror (err=%d)", displayID, err);
 }
 
+/// Selecting the physical native mode leaves the virtual mirror source and its
+/// HiDPI desktop geometry intact. Scaled mirror-only modes may be listed by
+/// CoreGraphics but are rejected when explicitly configured (error 1001).
+- (BOOL)pinNativeModeForDisplay:(CGDirectDisplayID)displayID atRate:(double)refreshRate {
+    if (refreshRate <= 0 || !CGDisplayIsOnline(displayID)) return NO;
+    CGDisplayModeRef desired = CopyBestModeAtRate(displayID, refreshRate);
+    if (!desired) return NO;
+
+    CGDisplayModeRef current = CGDisplayCopyDisplayMode(displayID);
+    BOOL unchanged = current &&
+        CGDisplayModeGetIODisplayModeID(current) == CGDisplayModeGetIODisplayModeID(desired);
+    if (current) CGDisplayModeRelease(current);
+    if (unchanged) {
+        CGDisplayModeRelease(desired);
+        return YES;
+    }
+
+    NSLog(@"VDM: Pinning physical output %u to %zux%zu @ %.1f Hz",
+          displayID, CGDisplayModeGetPixelWidth(desired),
+          CGDisplayModeGetPixelHeight(desired), CGDisplayModeGetRefreshRate(desired));
+    CGDisplayConfigRef config;
+    CGError err = CGBeginDisplayConfiguration(&config);
+    if (err == kCGErrorSuccess) {
+        err = CGConfigureDisplayWithDisplayMode(config, displayID, desired, NULL);
+        if (err == kCGErrorSuccess) {
+            err = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+        } else {
+            CGCancelDisplayConfiguration(config);
+        }
+    }
+    CGDisplayModeRelease(desired);
+    NSLog(@"VDM: Physical pin result: %d; variable-refresh state: %ld",
+          err, (long)VDMVariableRefreshState(displayID));
+    return err == kCGErrorSuccess;
+}
+
 - (BOOL)mirrorDisplay:(CGDirectDisplayID)sourceDisplayID
             toDisplay:(CGDirectDisplayID)targetDisplayID
                atRate:(double)refreshRate {
@@ -505,39 +585,8 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
     // panel in the pinned mode with no HiDPI to show for it.
     CGDisplayModeRef originalMode = CGDisplayCopyDisplayMode(targetDisplayID);
 
-    // Step 1 — pin the physical target to a fixed-rate native mode in its
-    // OWN config block BEFORE the mirror is set up. Combining pin + mirror
-    // in one config block conflicts (the mirror call resets target mode and
-    // rejects the whole config). Doing it first ensures the panel is in a
-    // stable fixed scanout when the mirror call attaches it to the source.
-    if (refreshRate > 0) {
-        CGDisplayModeRef pinMode = CopyBestModeAtRate(targetDisplayID, refreshRate);
-        if (pinMode) {
-            CGDisplayConfigRef pinConfig;
-            if (CGBeginDisplayConfiguration(&pinConfig) == kCGErrorSuccess) {
-                NSLog(@"VDM: Pinning target to %zux%zu @ %.1f Hz",
-                      CGDisplayModeGetWidth(pinMode),
-                      CGDisplayModeGetHeight(pinMode),
-                      CGDisplayModeGetRefreshRate(pinMode));
-                CGError pinErr = CGConfigureDisplayWithDisplayMode(pinConfig, targetDisplayID, pinMode, NULL);
-                if (pinErr == kCGErrorSuccess) {
-                    pinErr = CGCompleteDisplayConfiguration(pinConfig, kCGConfigureForSession);
-                    if (pinErr != kCGErrorSuccess) {
-                        NSLog(@"VDM: WARN - Pin complete failed: %d", pinErr);
-                    }
-                } else {
-                    NSLog(@"VDM: WARN - Pin configure failed: %d", pinErr);
-                    CGCancelDisplayConfiguration(pinConfig);
-                }
-            }
-            CGDisplayModeRelease(pinMode);
-        } else {
-            NSLog(@"VDM: WARN - No %.1f Hz mode found on target %u",
-                  refreshRate, targetDisplayID);
-        }
-    }
-
-    // Step 2 — configure the mirror in its own config block.
+    // Establish the mirror first. macOS can replace the target timing with a
+    // VRR mode here, even if a fixed native mode was selected beforehand.
     CGDisplayConfigRef configRef;
     CGError err = CGBeginDisplayConfiguration(&configRef);
     if (err != kCGErrorSuccess) {
@@ -567,9 +616,16 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
     }
     if (originalMode) CGDisplayModeRelease(originalMode);
 
-    // Verify what the panel ended up at — this is the ground truth for
-    // whether the pin survived. Log so we can confirm without needing to
-    // perceive the difference visually.
+    // Keep the source's HiDPI desktop, then select the physical native scanout in
+    // a separate transaction. Pinning before the mirror is overwritten; combining
+    // the two operations in one transaction is rejected on some configurations.
+    if (refreshRate > 0 && ![self pinNativeModeForDisplay:targetDisplayID atRate:refreshRate]) {
+        NSLog(@"VDM: WARN - Mirror is active but physical output pin failed");
+    }
+
+    // The source owns the HiDPI desktop; the target reports native output size.
+    NSLog(@"VDM: Mirror target variable-refresh state: %ld (0=fixed, 1=VRR, -1=unknown)",
+          (long)VDMVariableRefreshState(targetDisplayID));
     CGDisplayModeRef actual = CGDisplayCopyDisplayMode(targetDisplayID);
     if (actual) {
         NSLog(@"VDM: Mirror success — target %u now at %zux%zu @ %.1f Hz",
@@ -582,6 +638,84 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
         NSLog(@"VDM: Mirror success (could not read back target mode)");
     }
     return YES;
+}
+
+// Dock's outermost-edge walk includes the inactive mirror target. Its native
+// pixel-sized bounds can put the right edge outside the virtual desktop. The
+// session's Dock placement service can select the source without changing the
+// physical mode (changing that mode's scale regresses the hardware cursor).
+static BOOL VDMDockRepairApplies(CGDirectDisplayID source, CGDirectDisplayID target) {
+    if (!source || !target || CGMainDisplayID() != source ||
+        !CGDisplayIsOnline(source) || !CGDisplayIsOnline(target) ||
+        CGDisplayMirrorsDisplay(target) != source) return NO;
+    CGDirectDisplayID active[2] = {0};
+    uint32_t count = 0;
+    // Do not take over Dock placement while another desktop/Sidecar is active.
+    return CGGetActiveDisplayList(2, active, &count) == kCGErrorSuccess &&
+           count == 1 && active[0] == source;
+}
+
+- (void)repairDockPlacementForSource:(CGDirectDisplayID)sourceDisplayID
+                  mirroredToDisplay:(CGDirectDisplayID)targetDisplayID {
+    NSAssert([NSThread isMainThread], @"Dock repair must run on the main queue");
+    if (_dockRepairInFlight || sourceDisplayID != _currentDisplayID ||
+        !VDMDockRepairApplies(sourceDisplayID, targetDisplayID)) return;
+
+    __block xpc_connection_t connection = xpc_connection_create_mach_service(
+        "com.apple.dock.sidecar", dispatch_get_main_queue(), 0);
+    if (!connection) return;
+    _dockRepairInFlight = YES;
+    __block BOOL finished = NO;
+    __block BOOL requestedMove = NO;
+    // Under MRC the __block connection is not retained by the blocks. The
+    // create reference is released exactly once, including error/timeout paths.
+    void (^finish)(void) = ^{
+        if (finished) return;
+        finished = YES;
+        self->_dockRepairInFlight = NO;
+        xpc_connection_cancel(connection);
+        xpc_release(connection);
+        connection = NULL;
+    };
+    xpc_connection_set_event_handler(connection, ^(xpc_object_t event) {
+        if (finished) return;
+        if (xpc_get_type(event) != XPC_TYPE_DICTIONARY) {
+            finish();
+            return;
+        }
+        if (xpc_dictionary_get_uint64(event, "msg") != 100) return;
+        if (sourceDisplayID != self->_currentDisplayID ||
+            !VDMDockRepairApplies(sourceDisplayID, targetDisplayID)) {
+            finish();
+            return;
+        }
+        uint64_t dockDisplay = xpc_dictionary_get_uint64(event, "disp");
+        if (requestedMove) {
+            NSLog(@"VDM: Dock placement verified: source=%u, Dock=%llu",
+                  sourceDisplayID, (unsigned long long)dockDisplay);
+            finish();
+        } else if (dockDisplay == targetDisplayID) {
+            requestedMove = YES;
+            xpc_object_t move = xpc_dictionary_create(NULL, NULL, 0);
+            xpc_dictionary_set_uint64(move, "msg", 2);
+            xpc_dictionary_set_uint64(move, "disp", sourceDisplayID);
+            xpc_connection_send_message(connection, move);
+            xpc_release(move);
+        } else {
+            // Already on the source, or on an unrelated display: leave it alone.
+            finish();
+        }
+    });
+    xpc_connection_resume(connection);
+    xpc_object_t query = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_uint64(query, "msg", 1);
+    xpc_connection_send_message(connection, query);
+    xpc_release(query);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        if (!finished && requestedMove) NSLog(@"VDM: Dock placement request timed out");
+        finish();
+    });
 }
 
 - (BOOL)stopMirroringForDisplay:(CGDirectDisplayID)displayID {
@@ -899,7 +1033,7 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
                                     bluePrimary:blue];
 }
 
-#pragma mark - HDR control (Beta)
+#pragma mark - Physical HDR and output color
 
 // SkyLight exposes per-display HDR control that stays in sync with the
 // System Settings ▸ Displays "High Dynamic Range" checkbox. SkyLight is a
@@ -913,7 +1047,7 @@ static void *VDMSkyLightHandle(void) {
     dispatch_once(&once, ^{
         handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY);
         if (!handle) {
-            NSLog(@"VDM: WARNING - could not dlopen SkyLight for HDR control");
+            NSLog(@"VDM: WARNING - could not dlopen SkyLight for display control");
         }
     });
     return handle;
@@ -938,6 +1072,101 @@ static void *VDMSkyLightHandle(void) {
     int rc = fn(displayID, enabled ? true : false);
     NSLog(@"VDM: setHDREnabled(%d) for display %u -> rc=%d", enabled, displayID, rc);
     return rc == 0;
+}
+
+
+// The 16-byte link description is returned as two machine words by SkyLight.
+// Field mapping is the same mapping used by WS::Displays::make_link_description
+// for the named CADisplay RGB/YCbCr/full/limited/HDR10 constants. The final
+// output parameter of SLSGetDisplayOutputModeLinkDescriptions is the CURRENT
+// link index (also used by SLSDisplayIsHDRModeEnabled), not a preferred index.
+// Do not substitute IOMobileFramebuffer's different PixelEncoding enums.
+typedef struct {
+    uint32_t bitsPerComponent;
+    uint32_t range;
+    uint32_t eotf;
+    uint32_t encoding;
+} VDMOutputLink;
+_Static_assert(sizeof(VDMOutputLink) == 16, "SkyLight link ABI");
+
+typedef CGError (*VDMOutputCountFn)(CGDirectDisplayID, int32_t, uint32_t *);
+typedef CGError (*VDMOutputLinksFn)(CGDirectDisplayID, int32_t, VDMOutputLink *, uint32_t *, uint32_t *);
+typedef CGError (*VDMConfigureOutputFn)(CGDisplayConfigRef, CGDirectDisplayID, uint64_t, uint64_t);
+
+static NSDictionary *VDMOutputDictionary(VDMOutputLink link) {
+    return @{@"bitsPerComponent": @(link.bitsPerComponent), @"range": @(link.range),
+             @"eotf": @(link.eotf), @"encoding": @(link.encoding)};
+}
+
+- (NSDictionary<NSString *, id> *)outputStateForDisplay:(CGDirectDisplayID)displayID {
+    if (!CGDisplayIsOnline(displayID) || CGDisplayIsBuiltin(displayID) ||
+        [self isVirtualDisplay:displayID]) return nil;
+    void *handle = VDMSkyLightHandle();
+    if (!handle) return nil;
+    VDMOutputCountFn countFn = (VDMOutputCountFn)dlsym(handle, "SLSGetDisplayOutputModeCount");
+    VDMOutputLinksFn linksFn = (VDMOutputLinksFn)dlsym(handle, "SLSGetDisplayOutputModeLinkDescriptions");
+    if (!countFn || !linksFn) return nil;
+
+    // A concurrent mode change can invalidate the enumeration. Retry once and
+    // otherwise report unavailable rather than publish a mismatched format.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        CGDisplayModeRef timing = CGDisplayCopyDisplayMode(displayID);
+        if (!timing) return nil;
+        int32_t modeID = CGDisplayModeGetIODisplayModeID(timing);
+        CGDisplayModeRelease(timing);
+        uint32_t count = 0;
+        if (countFn(displayID, modeID, &count) != kCGErrorSuccess || count == 0 || count > 1024) return nil;
+        VDMOutputLink *links = calloc(count, sizeof(VDMOutputLink));
+        if (!links) return nil;
+        uint32_t capacity = count, current = UINT32_MAX;
+        CGError rc = linksFn(displayID, modeID, links, &count, &current);
+        timing = CGDisplayCopyDisplayMode(displayID);
+        BOOL sameTiming = timing && CGDisplayModeGetIODisplayModeID(timing) == modeID;
+        if (timing) CGDisplayModeRelease(timing);
+        if (rc != kCGErrorSuccess || count > capacity || !sameTiming) {
+            free(links);
+            continue;
+        }
+        NSMutableArray *modes = [NSMutableArray arrayWithCapacity:count];
+        for (uint32_t i = 0; i < count; ++i) [modes addObject:VDMOutputDictionary(links[i])];
+        free(links);
+        NSMutableDictionary *result = [NSMutableDictionary dictionaryWithDictionary:
+            @{@"modes": modes, @"modeID": @(modeID)}];
+        if (current < count) {
+            result[@"current"] = modes[current];
+            result[@"currentIndex"] = @(current);
+        }
+        return result;
+    }
+    return nil;
+}
+
+- (BOOL)setOutputMode:(NSDictionary<NSString *, NSNumber *> *)mode
+          forDisplay:(CGDirectDisplayID)displayID {
+    // Only exact formats the driver offers for this timing may be sent. Never
+    // synthesize a combination of independent depth/range/chroma preferences.
+    NSDictionary *state = [self outputStateForDisplay:displayID];
+    if (!state || ![state[@"modes"] containsObject:mode]) {
+        NSLog(@"VDM: output format unavailable for display %u: %@", displayID, mode);
+        return NO;
+    }
+    void *handle = VDMSkyLightHandle();
+    VDMConfigureOutputFn configure = handle ?
+        (VDMConfigureOutputFn)dlsym(handle, "SLSConfigureDisplayOutputMode") : NULL;
+    if (!configure) return NO;
+    uint64_t first = [mode[@"bitsPerComponent"] unsignedIntValue] |
+                     ((uint64_t)[mode[@"range"] unsignedIntValue] << 32);
+    uint64_t second = [mode[@"eotf"] unsignedIntValue] |
+                      ((uint64_t)[mode[@"encoding"] unsignedIntValue] << 32);
+    CGDisplayConfigRef config = NULL;
+    CGError rc = CGBeginDisplayConfiguration(&config);
+    if (rc == kCGErrorSuccess) {
+        rc = configure(config, displayID, first, second);
+        if (rc == kCGErrorSuccess) rc = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+        else CGCancelDisplayConfiguration(config);
+    }
+    NSLog(@"VDM: output format for display %u -> %@, rc=%d", displayID, mode, rc);
+    return rc == kCGErrorSuccess;
 }
 
 @end

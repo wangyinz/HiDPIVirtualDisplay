@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+App/build-*/
 *.app
 *.dSYM/
 *.o

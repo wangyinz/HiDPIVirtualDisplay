@@ -1,4 +1,9 @@
-# G9 Helper
+# G9 Helper — 8K fork
+
+This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
+right-edge Dock repair, and persistent physical HDR/color output. Current
+local build: **8.7**, based on upstream 1.2.6. Build this fork from source
+below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS%2012%2B-lightgrey.svg)](https://www.apple.com/macos/)
@@ -11,6 +16,7 @@ macOS gates HiDPI on pixel density, so big monitors like the G9 don't qualify �
 
 | Monitor | Native Resolution | Recommended Setting |
 |---------|------------------|---------------------|
+| 8K UHD TVs / monitors | 7680x4320 | 5120x2880 HiDPI (150%) |
 | Samsung Odyssey G9 57" | 7680x2160 | 5120x1440 HiDPI |
 | Samsung Odyssey G9 49" | 5120x1440 | 3840x1080 HiDPI |
 | 34" Ultrawide | 3440x1440 | 2560x1080 HiDPI |
@@ -30,12 +36,13 @@ brew install knightynite/g9-helper/g9-helper
 
 Grab [`G9.Helper-v1.2.6.dmg`](https://github.com/knightynite/HiDPIVirtualDisplay/releases/download/v1.2.6/G9.Helper-v1.2.6.dmg) from [Releases](https://github.com/knightynite/HiDPIVirtualDisplay/releases), open it, drag to Applications.
 
-The app is signed and notarized by Apple, so it opens without a security prompt.
+The upstream download is signed and notarized. Local builds of this fork use
+an ad-hoc signature unless a Developer ID signing identity is configured.
 
 ### Build from source
 
 ```bash
-git clone https://github.com/knightynite/HiDPIVirtualDisplay.git
+git clone https://github.com/wangyinz/HiDPIVirtualDisplay.git
 cd HiDPIVirtualDisplay/App
 ./build.sh
 cp -r "build/G9 Helper.app" /Applications/
@@ -49,15 +56,103 @@ Click the display icon in your menu bar, pick your monitor, pick a resolution pr
 
 Every monitor submenu has a **Custom Scale...** option — it opens a slider for any factor between 1.1x and 2.0x. The resolution preview updates as you drag.
 
-### HDR (beta)
+### HDR and physical color output (local build 8.7)
 
-If your monitor supports HDR, G9 Helper can keep it enabled across logins and reconnects, which macOS otherwise resets on every login. Hold Option, open the menu, go to **Settings**, and turn on **Keep HDR On (Beta)**. It is off by default and stays hidden unless you hold Option. Note that HDR makes the SDR desktop look dimmer and warmer, so it suits HDR video and games more than plain desktop and text work.
+Open **HDR & Color Output** while HiDPI is active. The **Current** line reads
+the physical display link's selected format. The HDR checkbox and the
+**HDR10 Output** / **SDR Output** submenus save preferences for the monitor's
+vendor, model and serial identity. SDR and HDR retain separate format choices.
+
+Changes to HDR made in System Settings are also remembered after two stable
+samples (about 1–2 seconds). Link teardown, sleep and restoration are excluded
+from observation so transient SDR on reconnect does not overwrite HDR On.
+After reconnect or mirror setup, fixed physical timing is settled first, then
+HDR and the chosen compatible color format are restored and read back.
+Unsuccessful repairs stop after three attempts. A saved format unavailable at
+the new timing is retained as a preference, with a visible fallback message.
+
+Only exact combinations enumerated by macOS for the current physical timing
+are offered: RGB or YCbCr chroma, bits per component, range, and SDR/HDR10.
+**Automatic (macOS)** returns that HDR/SDR state to the OS's default format.
+Selecting an HDR10 format enables HDR; selecting an SDR format disables it.
+The menu's checkmarks indicate saved choices; **Current** indicates readback.
+
+On the tested M4 Pro / Samsung QN990F / macOS 26.6.2 connection, native fixed
+7680×4320 at 60 Hz offers HDR10 RGB Full at 12 or 10 bits, and HDR10 YCbCr
+4:4:4 or 4:2:0 Limited at 10 bits. RGB Full 12-bit HDR was selected and read
+back without changing the physical 1:1 mode, mirror, or fixed refresh.
+This is OS-reported link format, not a framebuffer bit-depth inference or
+a claim about the panel's native bit depth. Actual unplug/replug verification
+remains a separate hardware check.
+
+These controls use dynamically resolved private SkyLight APIs and are disabled
+or reported unavailable when unsupported. Runtime validation was on Apple
+Silicon; the universal Intel slice was compiled, not hardware-tested.
+Run the focused preference tests with **App/Tests/run-display-output-tests.sh**.
 
 ## Keep external as main display
 
 If you make your external monitor the primary display (the one with the menu bar), macOS moves it back to the built-in screen after every sleep/wake. Open the menu, go to **Settings**, and turn on **Keep External as Main Display**. G9 Helper then re-asserts your external monitor as the main display whenever it sets up the mirror, including after waking from sleep. It is off by default.
 
 ## Resolution Presets
+
+### 8K UHD (7680x4320, 16:9)
+
+Use **8K UHD Displays (7680×4320)** in the menu for an 8K television or
+monitor. The G9 57" category is 32:9 and is not the right preset family for
+a 7680x4320 panel.
+
+| Looks-like resolution | Scale relative to 8K | HiDPI framebuffer |
+|-----------------------|----------------------|-------------------|
+| 6144x3456 | 125% | 12288x6912 |
+| 5760x3240 | 133.3% | 11520x6480 |
+| 5120x2880 | 150% | 10240x5760 |
+| 4800x2700 | 160% | 9600x5400 |
+| 4384x2466 | approximately 175% | 8768x4932 |
+| 4096x2304 | 187.5% | 8192x4608 |
+| 3840x2160 | 200% | 7680x4320 |
+
+The 175% preset preserves exact 16:9 with integer dimensions; its actual
+scale is approximately 175.18%. **Custom Scale...** in this submenu
+calculates other sizes from 7680x4320, with factors from 1.1x to 2.0x.
+
+These modes still use virtual display mirroring. The virtual framebuffer
+is resampled to the panel's native output; only the 200% preset matches
+the physical pixel grid exactly.
+
+Local build 8.7 keeps the stable output policy: distinguish fixed-refresh
+modes from VRR modes with the same maximum rate, then select a **one-to-one
+native physical mode after** establishing the mirror. The virtual source
+continues to supply the 2x HiDPI desktop. HDR/output changes are checked
+after a 1.5-second debounce, with the existing 30-second monitor as backup
+and at most three unsuccessful repair attempts.
+
+Build 8.6 repairs right-edge Dock placement after the display configuration
+settles. Dock can incorrectly choose the inactive physical mirror target,
+whose 7680x4320 bounds extend beyond the virtual desktop. A short,
+asynchronous request to the session's Dock placement service moves it back
+to the virtual source. The reply is checked and the connection is closed
+within two seconds. The repair only applies when our virtual source is
+the main display and is the only active desktop; it leaves other display
+arrangements alone.
+
+The fix was verified on the M4 Pro / QN990F with macOS 26.6.2: the Dock edge
+moved from x=7680 to x=4384 at approximately 175%, the user confirmed that
+the right-side Dock appeared, and restarting the app restored the placement
+automatically. Physical output stayed at native 8K, fixed 60 Hz. This uses a
+private macOS service and may need adaptation after an OS update.
+
+The physical target stays one-to-one, preserving the cursor-compatible
+path. An earlier experiment with a 2x physical mode caused arrow and text
+cursor disappearance; changing pointer size did not solve it.
+
+**Remaining work:** virtual mirroring still has added mouse latency.
+The Dock fix does not establish a latency improvement. Refresh callbacks
+and GPU utilization are being compared in a separate test build; neither
+is a measurement of end-to-end input latency.
+
+No TV Game Mode setting was changed. This local build is ad-hoc signed,
+not Developer ID notarized.
 
 ### Samsung G9 57" (7680x2160)
 
@@ -110,7 +205,7 @@ cd /path/to/HiDPIVirtualDisplay/App
 ## Known issues & limitations
 
 - Uses private macOS APIs — could break with future macOS updates
-- HDR is beta. It can be kept on across logins from Settings (hold Option), but it dims and warms the SDR desktop, which is normal HDR behavior on this panel
+- Physical HDR/color control uses private APIs. The visible HDR & Color Output menu lists compatible link formats and remembers the HDR choice per monitor.
 - Since 1.2.3, sleep/wake and brief monitor dropouts keep the existing setup (and your window layout) instead of rebuilding it; if HiDPI ever fails to come back, re-apply the preset from the menu
 - Switching presets or disabling HiDPI briefly restarts the app (virtual displays can only be fully torn down when the process exits)
 - Refresh rate is auto-detected; if your monitor flickers, set it manually under Settings > Refresh Rate

@@ -657,7 +657,15 @@ struct HiDPIDisplayApp: App {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+private let outputReconfigurationCallback: CGDisplayReconfigurationCallBack = { display, flags, context in
+    guard let context = context else { return }
+    let delegate = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
+    DispatchQueue.main.async { [weak delegate] in
+        delegate?.handleOutputTopologyChange(display, flags: flags)
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var currentPresetName = ""
     private var isActive = false
@@ -670,7 +678,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let kAutoRestoreKey = "autoRestoreOnCrash"
     private let kAutoApplyOnConnectKey = "autoApplyOnConnect"
     private let kRefreshRateKey = "customRefreshRate"  // 0.0 = auto-detect
-    private let kKeepHDREnabledKey = "keepHDREnabledBeta"  // Beta: keep HDR on the mirror target
+    private let kKeepHDREnabledKey = "keepHDREnabledBeta"  // Migration from 8.6 and earlier
+    private let kOutputPreferencesKey = "displayOutputPreferencesV1"
+    private var outputMenu: NSMenu?
+    private var outputObservationTimer: Timer?
+    private var outputCallbackRegistered = false
+    private var outputRestore = OutputRestoreBudget()
+    private var hdrSelectionObserver = HDRSelectionObserver()
+    private var outputObservationAfter: TimeInterval = 0
+    private var forceAutomaticOutput = false
+    private var outputRestoreMessage: String?
     private let kKeepPrimaryDisplayKey = "keepExternalAsMainDisplay"  // Keep the external monitor as the main display (menu bar)
     private let kBoundMonitorVendorKey = "boundMonitorVendor"
     private let kBoundMonitorModelKey = "boundMonitorModel"
@@ -705,6 +722,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Display change observer
     private var displayObserver: Any?
     private var displayCheckTimer: Timer?
+    private var fixedRefreshWorkItem: DispatchWorkItem?
+    private var fixedRefreshRepairAttempts = 0
     private var wakeObserver: Any?
     private var screenSleepObserver: Any?
     private var screenWakeObserver: Any?
@@ -758,6 +777,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Restore wasDisconnected state from UserDefaults (persists across restart)
         wasDisconnected = UserDefaults.standard.bool(forKey: kWasDisconnectedKey)
         debugLog("Restored wasDisconnected state: \(wasDisconnected)")
+
+        // Capture the initial HDR choice before cleanup can reset the link.
+        // Existing per-monitor preferences always win over reconnect defaults.
+        if let physical = findExternalDisplay() { prepareOutputPreference(for: physical) }
 
         // Clean up any stale state from previous sessions
         cleanupStaleState()
@@ -815,6 +838,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleDisplayConfigurationChange()
         }
 
+        let callbackResult = CGDisplayRegisterReconfigurationCallback(
+            outputReconfigurationCallback, Unmanaged.passUnretained(self).toOpaque())
+        outputCallbackRegistered = callbackResult == .success
+        // HDR changes do not always generate an NSScreen notification.
+        let outputTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.observeManualHDRSelection()
+            if let self = self, self.outputRestore.pending, self.fixedRefreshWorkItem == nil {
+                self.scheduleFixedRefreshCheck()
+            }
+        }
+        outputObservationTimer = outputTimer
+        RunLoop.main.add(outputTimer, forMode: .common)
+
         // Backup timer — notifications handle most changes, this catches edge cases
         displayCheckTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
             self?.periodicDisplayCheck()
@@ -838,6 +874,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             debugLog(">>> Screens did sleep — deferring disconnect handling")
             self?.screensAsleep = true
+            self?.beginOutputRestore()
         }
 
         screenWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -847,6 +884,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             debugLog(">>> Screens did wake")
             self?.screensAsleep = false
+            self?.beginOutputRestore()
+            self?.scheduleFixedRefreshCheck()
             // The panel takes a few seconds to re-enumerate; the display-change
             // notification then repairs the mirror if it broke. The periodic
             // check is the backstop if no notification arrives.
@@ -856,6 +895,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func stopDisplayChangeMonitoring() {
+        outputObservationTimer?.invalidate()
+        outputObservationTimer = nil
+        if outputCallbackRegistered {
+            CGDisplayRemoveReconfigurationCallback(
+                outputReconfigurationCallback, Unmanaged.passUnretained(self).toOpaque())
+            outputCallbackRegistered = false
+        }
         if let observer = displayObserver {
             NotificationCenter.default.removeObserver(observer)
             displayObserver = nil
@@ -872,6 +918,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
             screenWakeObserver = nil
         }
+        fixedRefreshWorkItem?.cancel()
+        fixedRefreshWorkItem = nil
         displayCheckTimer?.invalidate()
         displayCheckTimer = nil
         debugLog("Display change monitoring stopped")
@@ -880,6 +928,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func periodicDisplayCheck() {
         // Don't trigger cleanup during setup or pending restart
         if isSettingUp || isRestarting { return }
+
+        // HDR may change the output timing without changing the display count.
+        scheduleFixedRefreshCheck()
 
         // Skip if nothing changed since last check
         var rawDisplayList = [CGDirectDisplayID](repeating: 0, count: 32)
@@ -948,6 +999,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         debugLog(">>> Wake: assessing display state before deciding on restore")
+        beginOutputRestore()
 
         // Mark as setting up to prevent other handlers from interfering
         isSettingUp = true
@@ -1030,10 +1082,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
               let physical = findExternalDisplay() else {
             return false
         }
+        // macOS can give the same monitor a new ID after reconnecting even
+        // when it has already restored the mirror. Rebind before the no-op.
+        if targetExternalDisplayID != physical {
+            targetExternalDisplayID = physical
+            prepareOutputPreference(for: physical)
+            beginOutputRestore()
+        }
         if CGDisplayMirrorsDisplay(physical) == currentVirtualID {
             return true
         }
         debugLog("Mirror link broken — re-attaching \(currentVirtualID) -> \(physical) without rebuild")
+        prepareOutputPreference(for: physical)
+        beginOutputRestore()
         let manager = VirtualDisplayManager.shared()
         let ok = manager.mirrorDisplay(currentVirtualID, toDisplay: physical, atRate: getDisplayRefreshRate(physical))
         debugLog("Re-attach mirror result: \(ok)")
@@ -1043,24 +1104,74 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return ok
     }
 
-    /// Re-apply the optional HDR and main-display preferences after the mirror
-    /// is (re)established. Shared by first apply, wake restore, and transient
-    /// dropout recovery.
+    /// Settle fixed physical timing first, then restore HDR and the exact link
+    /// format. Pinning a timing after restoring HDR can otherwise undo it.
     func reassertPreferencesAfterSetup() {
-        if UserDefaults.standard.bool(forKey: kKeepHDREnabledKey) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                self?.applyHDRPreference()
-            }
-        }
+        fixedRefreshRepairAttempts = 0
+        beginOutputRestore()
+        scheduleFixedRefreshCheck()
+        let generation = setupGeneration
         if UserDefaults.standard.bool(forKey: kKeepPrimaryDisplayKey) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                self?.applyPrimaryDisplayPreference()
+                guard let self = self, generation == self.setupGeneration,
+                      self.isActive, !self.isRestarting, !self.screensAsleep else { return }
+                self.applyPrimaryDisplayPreference()
             }
         }
     }
 
+    /// HDR and link reconfiguration can re-enable VRR on an otherwise intact
+    /// mirror. Debounce notifications, touch only our active target, and stop
+    /// after three failed repairs until a stable mode or a new setup is observed.
+    func scheduleFixedRefreshCheck() {
+        guard isActive, !isSettingUp, !isRestarting, !screensAsleep else { return }
+        fixedRefreshWorkItem?.cancel()
+        let generation = setupGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.fixedRefreshWorkItem = nil
+            let target = self.targetExternalDisplayID
+            guard generation == self.setupGeneration,
+                  self.isActive, !self.isSettingUp, !self.isRestarting, !self.screensAsleep,
+                  target != 0, self.currentVirtualID != 0,
+                  self.displayIsOnline(target), self.displayIsOnline(self.currentVirtualID),
+                  CGDisplayMirrorsDisplay(target) == self.currentVirtualID else { return }
+
+            VirtualDisplayManager.shared().repairDockPlacement(
+                forSource: self.currentVirtualID, mirroredToDisplay: target)
+            self.observeManualHDRSelection()
+            let state = VDMVariableRefreshState(target)
+            if state == 0 || state == -1 {
+                if state == 0 { self.fixedRefreshRepairAttempts = 0 }
+                self.restoreOutputPreferenceIfNeeded()
+                return
+            }
+            guard state == 1 else { return }
+            guard self.fixedRefreshRepairAttempts < 3 else {
+                if self.outputRestore.pending {
+                    self.finishOutputRestore(
+                        actualHDR: VirtualDisplayManager.shared().isHDREnabled(forDisplay: target),
+                        message: "Fixed refresh did not hold; color restoration paused.")
+                }
+                return
+            }
+            // A manual HDR change may have enabled VRR. Its stable choice has
+            // been captured above; do not learn the pin's transient SDR state.
+            if !self.outputRestore.pending { self.beginOutputRestore() }
+            self.outputObservationAfter = Date().timeIntervalSinceReferenceDate + 4
+            self.fixedRefreshRepairAttempts += 1
+            let ok = VirtualDisplayManager.shared().pinNativeMode(
+                forDisplay: target, atRate: self.getDisplayRefreshRate(target))
+            debugLog("Fixed refresh repair \(self.fixedRefreshRepairAttempts)/3: \(ok)")
+            self.scheduleFixedRefreshCheck()
+        }
+        fixedRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
     func handleDisplayConfigurationChange() {
         debugLog("Display configuration changed, checking state...")
+        observeManualHDRSelection()
 
         // Don't trigger cleanup during setup or pending restart
         if isSettingUp || isRestarting {
@@ -1084,6 +1195,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // mirror (e.g. the monitor enumerated after the wake
                 // assessment gave up). Repair in place; no-op when intact.
                 ensureMirrorIntact()
+                scheduleFixedRefreshCheck()
             }
             return
         }
@@ -1209,6 +1321,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             debugLog("Monitor gone but screens are asleep — not a disconnect, deferring")
             return
         }
+        beginOutputRestore()
         disconnectConfirmationPending = true
         debugLog("Disconnect suspected — re-checking for \(3 * 4)s before tearing down")
         confirmDisconnect(attempt: 1)
@@ -1233,6 +1346,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         self.setupGeneration += 1
                         self.restorePreset(preset)
                     }
+                } else if self.isActive {
+                    self.reassertPreferencesAfterSetup()
                 }
                 return
             }
@@ -1275,6 +1390,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let kWasDisconnectedKey = "wasDisconnected"
 
     func relaunchApp() {
+        captureHDRBeforeTeardown()
         // Switching a preset (or cleaning up after a disconnect) restarts the app
         // so macOS reclaims the old virtual display object — CGVirtualDisplay only
         // frees on process exit. Coming back reliably needs BOTH mechanisms below,
@@ -1464,6 +1580,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         debugLog(">>> Auto-restoring preset: \(presetName)")
+        if let physical = findExternalDisplay() { prepareOutputPreference(for: physical) }
+        beginOutputRestore()
 
         // Mark that we're setting up (don't trigger cleanup during setup)
         isSettingUp = true
@@ -1521,6 +1639,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         debugLog("App terminating - cleaning up...")
+        captureHDRBeforeTeardown()
 
         // Stop monitoring
         stopDisplayChangeMonitoring()
@@ -1578,6 +1697,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(statusItem)
             menu.addItem(NSMenuItem.separator())
         }
+
+        let colorMenu = NSMenu()
+        colorMenu.delegate = self
+        outputMenu = colorMenu
+        populateOutputMenu(colorMenu)
+        let colorItem = NSMenuItem(title: "HDR & Color Output", action: nil, keyEquivalent: "")
+        colorItem.submenu = colorMenu
+        menu.addItem(colorItem)
+        menu.addItem(NSMenuItem.separator())
+
+        // 8K UHD (7680x4320), a 16:9 panel rather than the G9's 32:9 grid.
+        let k8Menu = NSMenu()
+        addPresetItem(to: k8Menu, preset: "8k-6144x3456", title: "6144×3456 (125%) - More Space")
+        addPresetItem(to: k8Menu, preset: "8k-5760x3240", title: "5760×3240 (133.3%)")
+        addPresetItem(to: k8Menu, preset: "8k-5120x2880", title: "5120×2880 (150%)")
+        addPresetItem(to: k8Menu, preset: "8k-4800x2700", title: "4800×2700 (160%)")
+        addPresetItem(to: k8Menu, preset: "8k-4384x2466", title: "4384×2466 (≈175%)")
+        addPresetItem(to: k8Menu, preset: "8k-4096x2304", title: "4096×2304 (187.5%)")
+        addPresetItem(to: k8Menu, preset: "8k-3840x2160", title: "3840×2160 (200%) - Native 2x")
+        addCustomScaleItem(to: k8Menu, nativeWidth: 7680, nativeHeight: 4320, ppi: 163)
+
+        let k8Item = NSMenuItem(title: "8K UHD Displays (7680×4320)", action: nil, keyEquivalent: "")
+        k8Item.submenu = k8Menu
+        menu.addItem(k8Item)
 
         // Samsung G9 57" (7680x2160) presets - ordered by scale factor (smaller = more space)
         let g9Menu = NSMenu()
@@ -1690,16 +1833,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         autoUpdateItem.state = UpdateChecker.shared.autoCheckEnabled ? .on : .off
         settingsMenu.addItem(autoUpdateItem)
 
-        // Hidden beta toggle — revealed only when the menu is opened with Option held
-        // (it replaces the "Check for Updates Automatically" row). Keeps HDR enabled on
-        // the physical mirror target across logins/reconnects, which macOS otherwise resets.
-        let hdrBetaItem = NSMenuItem(title: "Keep HDR On (Beta)", action: #selector(toggleHDRBeta(_:)), keyEquivalent: "")
-        hdrBetaItem.target = self
-        hdrBetaItem.isAlternate = true
-        hdrBetaItem.keyEquivalentModifierMask = [.option]
-        hdrBetaItem.state = UserDefaults.standard.bool(forKey: kKeepHDREnabledKey) ? .on : .off
-        settingsMenu.addItem(hdrBetaItem)
-
         settingsMenu.addItem(NSMenuItem.separator())
 
         // Refresh rate submenu
@@ -1786,11 +1919,258 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    @objc func toggleHDRBeta(_ sender: NSMenuItem) {
-        let newValue = !UserDefaults.standard.bool(forKey: kKeepHDREnabledKey)
-        UserDefaults.standard.set(newValue, forKey: kKeepHDREnabledKey)
-        debugLog("Keep HDR on (beta): \(newValue)")
-        applyHDRPreference()
+    private func outputMonitorKey(_ target: CGDirectDisplayID) -> String {
+        "\(CGDisplayVendorNumber(target))-\(CGDisplayModelNumber(target))-\(CGDisplaySerialNumber(target))"
+    }
+
+    private func outputPreference(for target: CGDirectDisplayID) -> DisplayOutputPreference? {
+        let records = UserDefaults.standard.dictionary(forKey: kOutputPreferencesKey) ?? [:]
+        return (records[outputMonitorKey(target)] as? [String: Any])
+            .flatMap(DisplayOutputPreference.init(dictionary:))
+    }
+
+    private func saveOutputPreference(_ preference: DisplayOutputPreference, for target: CGDirectDisplayID) {
+        var records = UserDefaults.standard.dictionary(forKey: kOutputPreferencesKey) ?? [:]
+        records[outputMonitorKey(target)] = preference.dictionary
+        UserDefaults.standard.set(records, forKey: kOutputPreferencesKey)
+        // A confirmed disconnect can immediately relaunch the app.
+        UserDefaults.standard.synchronize()
+    }
+
+    private func prepareOutputPreference(for target: CGDirectDisplayID) {
+        guard displayIsOnline(target), CGDisplayIsBuiltin(target) == 0,
+              !VirtualDisplayManager.shared().isVirtualDisplay(target),
+              outputPreference(for: target) == nil else { return }
+        let manager = VirtualDisplayManager.shared()
+        let legacy = UserDefaults.standard.bool(forKey: kKeepHDREnabledKey) &&
+            !UserDefaults.standard.bool(forKey: "legacyHDRPreferenceMigrated")
+        let hdr = legacy || manager.isHDREnabled(forDisplay: target)
+        saveOutputPreference(DisplayOutputPreference(hdrEnabled: hdr), for: target)
+        UserDefaults.standard.set(true, forKey: "legacyHDRPreferenceMigrated")
+        debugLog("Output: saved initial HDR \(hdr) for monitor \(outputMonitorKey(target))")
+    }
+
+    func beginOutputRestore() {
+        outputRestore.begin()
+        outputRestoreMessage = nil
+        hdrSelectionObserver.reset(to: hdrSelectionObserver.baseline)
+    }
+
+    func handleOutputTopologyChange(_ display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
+        guard isActive, display == targetExternalDisplayID else { return }
+        if flags.contains(.removeFlag) || flags.contains(.addFlag) {
+            // Topology changes are not a manual HDR-off choice. Preserve the
+            // last stable preference before a reconnect defaults to SDR.
+            beginOutputRestore()
+            scheduleFixedRefreshCheck()
+        }
+    }
+
+    private func stableOutputTarget() -> CGDirectDisplayID? {
+        let target = targetExternalDisplayID
+        guard isActive, !isSettingUp, !isRestarting, !screensAsleep,
+              !disconnectConfirmationPending, displayIsOnline(target),
+              displayIsOnline(currentVirtualID),
+              CGDisplayMirrorsDisplay(target) == currentVirtualID else { return nil }
+        return target
+    }
+
+    func observeManualHDRSelection() {
+        guard !outputRestore.pending,
+              Date().timeIntervalSinceReferenceDate >= outputObservationAfter,
+              let target = stableOutputTarget() else { return }
+        let manager = VirtualDisplayManager.shared()
+        guard manager.displaySupportsHDR(target) else { return }
+        let now = Date().timeIntervalSinceReferenceDate
+        let hdr = manager.isHDREnabled(forDisplay: target)
+        guard let changed = hdrSelectionObserver.observe(hdr, at: now),
+              var preference = outputPreference(for: target) else { return }
+        preference.hdrEnabled = changed
+        saveOutputPreference(preference, for: target)
+        debugLog("Output: remembered manual System Settings HDR \(changed)")
+        beginOutputRestore()  // Also restore the chosen format for this HDR/SDR state.
+        scheduleFixedRefreshCheck()
+        rebuildMenu()
+    }
+
+    private func captureHDRBeforeTeardown() {
+        let target = targetExternalDisplayID
+        guard !outputRestore.pending, !screensAsleep, !disconnectConfirmationPending,
+              Date().timeIntervalSinceReferenceDate >= outputObservationAfter,
+              isActive, displayIsOnline(target), displayIsOnline(currentVirtualID),
+              CGDisplayMirrorsDisplay(target) == currentVirtualID,
+              var preference = outputPreference(for: target) else { return }
+        preference.hdrEnabled = VirtualDisplayManager.shared().isHDREnabled(forDisplay: target)
+        saveOutputPreference(preference, for: target)
+    }
+
+    private func finishOutputRestore(actualHDR: Bool, message: String? = nil) {
+        outputRestore.finish()
+        forceAutomaticOutput = false
+        hdrSelectionObserver.reset(to: actualHDR)
+        outputObservationAfter = Date().timeIntervalSinceReferenceDate + 2
+        outputRestoreMessage = message
+        if let message = message { debugLog("Output: \(message)") }
+        rebuildMenu()
+    }
+
+    func restoreOutputPreferenceIfNeeded() {
+        guard outputRestore.pending, let target = stableOutputTarget(),
+              let preference = outputPreference(for: target) else { return }
+        let manager = VirtualDisplayManager.shared()
+        let hdr = manager.isHDREnabled(forDisplay: target)
+        let state = manager.outputState(forDisplay: target)
+        let modes = (state?["modes"] as? [[String: Any]] ?? [])
+            .compactMap(DisplayOutputMode.init(dictionary:))
+        let current = (state?["current"] as? [String: Any]).flatMap(DisplayOutputMode.init(dictionary:))
+        let preferred = preference.mode(forHDR: preference.hdrEnabled)
+        let compatible = preferred.flatMap { modes.contains($0) ? $0 : nil }
+        let unavailable = preferred != nil && compatible == nil
+        let matches = hdr == preference.hdrEnabled &&
+            (compatible == nil || compatible == current) && !forceAutomaticOutput
+        if matches {
+            debugLog("Output: restored \(current?.statusTitle ?? (hdr ? "HDR on" : "HDR off"))")
+            finishOutputRestore(actualHDR: hdr, message: unavailable
+                ? "Saved format unavailable at this timing; using macOS format." : nil)
+            return
+        }
+        guard !preference.hdrEnabled || manager.displaySupportsHDR(target) else {
+            finishOutputRestore(actualHDR: hdr, message: "HDR unavailable on this connection.")
+            return
+        }
+        guard outputRestore.consumeAttempt() else {
+            finishOutputRestore(actualHDR: hdr, message: "Setting did not hold. Select a format to retry.")
+            return
+        }
+        outputObservationAfter = Date().timeIntervalSinceReferenceDate + 4
+        let ok: Bool
+        if let mode = compatible {
+            ok = manager.setOutputMode(mode.dictionary, forDisplay: target)
+        } else {
+            // The SkyLight HDR setter selects macOS's default compatible link.
+            // Calling it even when HDR already matches implements Automatic.
+            ok = manager.setHDREnabled(preference.hdrEnabled, forDisplay: target)
+        }
+        if ok { forceAutomaticOutput = false }
+        debugLog("Output: restore attempt \(outputRestore.attempts)/3 accepted=\(ok)")
+        scheduleFixedRefreshCheck() // Recheck fixed refresh AND actual link format.
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === outputMenu { populateOutputMenu(menu) }
+    }
+
+    private func populateOutputMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        menu.autoenablesItems = false
+        func note(_ title: String) {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+        guard let target = stableOutputTarget() else {
+            note("Enable HiDPI on the connected display first.")
+            return
+        }
+        let manager = VirtualDisplayManager.shared()
+        prepareOutputPreference(for: target)
+        guard let preference = outputPreference(for: target) else { return }
+        let monitor = outputMonitorKey(target)
+        let state = manager.outputState(forDisplay: target)
+        let modes = (state?["modes"] as? [[String: Any]] ?? [])
+            .compactMap(DisplayOutputMode.init(dictionary:)).filter(\.isSelectable)
+        let current = (state?["current"] as? [String: Any]).flatMap(DisplayOutputMode.init(dictionary:))
+        let hdr = manager.isHDREnabled(forDisplay: target)
+        note("Current: \(current?.statusTitle ?? (hdr ? "HDR on · Format unavailable" : "HDR off · Format unavailable"))")
+        if outputRestore.pending { note("Applying saved HDR and color settings…") }
+        if let message = outputRestoreMessage { note(message) }
+        menu.addItem(.separator())
+
+        let hdrItem = NSMenuItem(title: "HDR", action: #selector(togglePhysicalHDR(_:)), keyEquivalent: "")
+        hdrItem.target = self
+        hdrItem.representedObject = monitor
+        hdrItem.state = preference.hdrEnabled ? .on : .off
+        hdrItem.isEnabled = manager.displaySupportsHDR(target)
+        menu.addItem(hdrItem)
+        if hdr != preference.hdrEnabled { note("Saved: HDR \(preference.hdrEnabled ? "on" : "off")") }
+        menu.addItem(.separator())
+
+        for wantsHDR in [true, false] {
+            let group = NSMenu()
+            group.autoenablesItems = false
+            let chosen = preference.mode(forHDR: wantsHDR)
+            let automatic = NSMenuItem(title: "Automatic (macOS)", action: #selector(selectAutomaticOutput(_:)), keyEquivalent: "")
+            automatic.target = self
+            automatic.representedObject = ["monitor": monitor, "hdr": wantsHDR] as [String: Any]
+            automatic.state = chosen == nil ? .on : .off
+            automatic.isEnabled = !wantsHDR || manager.displaySupportsHDR(target)
+            group.addItem(automatic)
+            for mode in modes.filter({ $0.isHDR == wantsHDR }).sorted(by: {
+                if $0.encoding != $1.encoding { return $0.encoding < $1.encoding }
+                if $0.range != $1.range { return $0.range > $1.range }
+                return $0.bitsPerComponent > $1.bitsPerComponent
+            }) {
+                let item = NSMenuItem(title: mode.title, action: #selector(selectPhysicalOutput(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = ["monitor": monitor, "mode": mode.dictionary] as [String: Any]
+                item.state = chosen == mode ? .on : .off
+                item.isEnabled = true
+                group.addItem(item)
+            }
+            if let chosen = chosen, !modes.contains(chosen) {
+                let item = NSMenuItem(title: "Saved: \(chosen.title) (unavailable)", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                group.addItem(item)
+            }
+            let item = NSMenuItem(title: wantsHDR ? "HDR10 Output" : "SDR Output", action: nil, keyEquivalent: "")
+            item.submenu = group
+            item.isEnabled = true
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        note("Saved for this display; restored after reconnect.")
+        note("System Settings HDR changes are remembered.")
+    }
+
+    @objc private func togglePhysicalHDR(_ sender: NSMenuItem) {
+        guard let target = stableOutputTarget(), sender.representedObject as? String == outputMonitorKey(target),
+              var preference = outputPreference(for: target) else { return }
+        preference.hdrEnabled.toggle()
+        saveOutputPreference(preference, for: target)
+        forceAutomaticOutput = false
+        beginOutputRestore()
+        scheduleFixedRefreshCheck()
+        rebuildMenu()
+    }
+
+    @objc private func selectAutomaticOutput(_ sender: NSMenuItem) {
+        guard let target = stableOutputTarget(), let choice = sender.representedObject as? [String: Any],
+              choice["monitor"] as? String == outputMonitorKey(target),
+              let hdr = choice["hdr"] as? Bool, var preference = outputPreference(for: target) else { return }
+        preference.select(nil, forHDR: hdr)
+        saveOutputPreference(preference, for: target)
+        forceAutomaticOutput = true
+        beginOutputRestore()
+        scheduleFixedRefreshCheck()
+        rebuildMenu()
+    }
+
+    @objc private func selectPhysicalOutput(_ sender: NSMenuItem) {
+        guard let target = stableOutputTarget(), let choice = sender.representedObject as? [String: Any],
+              choice["monitor"] as? String == outputMonitorKey(target),
+              let dictionary = choice["mode"] as? [String: Any],
+              let mode = DisplayOutputMode(dictionary: dictionary), mode.isSelectable,
+              var preference = outputPreference(for: target) else { return }
+        // Revalidate the menu selection in case the timing changed while open.
+        let state = VirtualDisplayManager.shared().outputState(forDisplay: target)
+        let available = (state?["modes"] as? [[String: Any]] ?? [])
+            .compactMap(DisplayOutputMode.init(dictionary:))
+        guard available.contains(mode) else { rebuildMenu(); return }
+        preference.select(mode, forHDR: mode.isHDR)
+        saveOutputPreference(preference, for: target)
+        forceAutomaticOutput = false
+        beginOutputRestore()
+        scheduleFixedRefreshCheck()
         rebuildMenu()
     }
 
@@ -1804,30 +2184,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             applyPrimaryDisplayPreference()
         }
         rebuildMenu()
-    }
-
-    /// Apply the "Keep HDR On (Beta)" preference to the current physical mirror
-    /// target. Enabling HDR re-applies the panel state macOS otherwise resets on
-    /// login; disabling turns it back off. No-op when no mirror target is active
-    /// or the target doesn't advertise HDR.
-    func applyHDRPreference() {
-        let target = targetExternalDisplayID
-        guard target != 0 else {
-            debugLog("HDR: no active mirror target, skipping")
-            return
-        }
-        let manager = VirtualDisplayManager.shared()
-        let want = UserDefaults.standard.bool(forKey: kKeepHDREnabledKey)
-        guard manager.displaySupportsHDR(target) else {
-            debugLog("HDR: display \(target) does not support HDR, skipping")
-            return
-        }
-        if manager.isHDREnabled(forDisplay: target) == want {
-            debugLog("HDR: display \(target) already \(want ? "on" : "off")")
-            return
-        }
-        let ok = manager.setHDREnabled(want, forDisplay: target)
-        debugLog("HDR: setHDREnabled(\(want)) for \(target) -> \(ok)")
     }
 
     /// Make the given display the main display (the one that owns the menu bar).
@@ -2010,6 +2366,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func applyPreset(_ sender: NSMenuItem) {
+        captureHDRBeforeTeardown()
         guard let presetName = sender.representedObject as? String else { return }
         debugLog(">>> Applying preset: \(presetName)")
 
@@ -2059,6 +2416,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Disable HiDPI when user explicitly requests it - clears preset (no auto-restore)
     func disableHiDPISync() {
+        captureHDRBeforeTeardown()
+        outputRestore.finish()
         debugLog("Disabling HiDPI (user action) - currentVirtualID: \(currentVirtualID)")
         setupGeneration += 1  // Cancel any in-flight setup steps
         isSettingUp = false   // A cancelled setup step won't clear this itself
@@ -2208,6 +2567,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         debugLog("Using external display: \(externalID)")
+        prepareOutputPreference(for: externalID)
+        beginOutputRestore()
         logPanelModeSummary(externalID)
 
         StatusWindowController.shared.updateStatus("Creating virtual display...")
@@ -2289,7 +2650,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            // Re-apply HDR (beta) and main-display preferences once the mirror
+            // Re-apply physical output and main-display preferences once the mirror
             // has settled — macOS resets both on login/sleep-wake.
             reassertPreferencesAfterSetup()
         } else {
@@ -2565,6 +2926,17 @@ struct PresetConfig {
 }
 
 let presetConfigs: [String: PresetConfig] = [
+    // 8K UHD (7680x4320 native). All presets preserve 16:9 and use a
+    // framebuffer twice the logical dimensions in each direction.
+    // 175% is rounded to the nearest 16:9 integer size (actual scale ~175.18%).
+    "8k-6144x3456": PresetConfig(name: "8K-6144", width: 12288, height: 6912, logicalWidth: 6144, logicalHeight: 3456, ppi: 163, hiDPI: true),
+    "8k-5760x3240": PresetConfig(name: "8K-5760", width: 11520, height: 6480, logicalWidth: 5760, logicalHeight: 3240, ppi: 163, hiDPI: true),
+    "8k-5120x2880": PresetConfig(name: "8K-5120", width: 10240, height: 5760, logicalWidth: 5120, logicalHeight: 2880, ppi: 163, hiDPI: true),
+    "8k-4800x2700": PresetConfig(name: "8K-4800", width: 9600, height: 5400, logicalWidth: 4800, logicalHeight: 2700, ppi: 163, hiDPI: true),
+    "8k-4384x2466": PresetConfig(name: "8K-4384", width: 8768, height: 4932, logicalWidth: 4384, logicalHeight: 2466, ppi: 163, hiDPI: true),
+    "8k-4096x2304": PresetConfig(name: "8K-4096", width: 8192, height: 4608, logicalWidth: 4096, logicalHeight: 2304, ppi: 163, hiDPI: true),
+    "8k-3840x2160": PresetConfig(name: "8K-3840", width: 7680, height: 4320, logicalWidth: 3840, logicalHeight: 2160, ppi: 163, hiDPI: true),
+
     // Samsung G9 57" (7680x2160 native) - Fractional scaling options
     // Scale factor = native / logical, e.g., 7680/5120 = 1.5x
     "g9-57-6144x1728": PresetConfig(name: "G9-57-6144", width: 12288, height: 3456, logicalWidth: 6144, logicalHeight: 1728, ppi: 140, hiDPI: true),  // 1.25x

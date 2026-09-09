@@ -12,7 +12,7 @@ MACOS="${CONTENTS}/MacOS"
 RESOURCES="${CONTENTS}/Resources"
 
 # Source files
-SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift"
+SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift Sources/DisplayOutputPreferences.swift"
 OBJC_SOURCES="Sources/VirtualDisplayManager.m"
 BRIDGING_HEADER="Sources/BridgingHeader.h"
 
@@ -43,7 +43,7 @@ for ARCH in ${ARCHS}; do
     echo "Compiling Swift and linking for ${ARCH}..."
     swiftc \
         -target ${TARGET} \
-        -parse-as-library \
+        -parse-as-library -O \
         ${SWIFT_SOURCES} \
         "${BUILD_DIR}/VirtualDisplayManager-${ARCH}.o" \
         -import-objc-header ${BRIDGING_HEADER} \

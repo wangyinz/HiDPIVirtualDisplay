@@ -14,6 +14,9 @@ BOOL VDMNativePixelSize(CGDirectDisplayID displayID,
                         size_t * _Nullable outWidth,
                         size_t * _Nullable outHeight);
 
+/// Current mode refresh policy: 0 = fixed, 1 = variable, -1 = unavailable.
+NSInteger VDMVariableRefreshState(CGDirectDisplayID displayID);
+
 @interface VirtualDisplayManager : NSObject
 
 /// Shared instance
@@ -51,10 +54,10 @@ BOOL VDMNativePixelSize(CGDirectDisplayID displayID,
             toDisplay:(CGDirectDisplayID)targetDisplayID;
 
 /// Mirror a virtual display to a physical display, pinning the physical target
-/// to a native-resolution mode at the requested refresh rate. This prevents
-/// macOS from leaving the physical panel in a variable-refresh (Adaptive Sync)
-/// scanout mode, which causes hardware-cursor glitches and effective refresh
-/// rate downgrades when mirroring from a virtual source.
+/// to a native-resolution mode after establishing the mirror. Fixed-refresh
+/// modes are preferred over VRR modes with the same maximum rate, when the
+/// system exposes the distinction. Keep the target one-to-one for cursor
+/// compatibility; the mirror source keeps its HiDPI desktop.
 /// @param sourceDisplayID The virtual display ID (mirror source)
 /// @param targetDisplayID The physical display ID (mirror target)
 /// @param refreshRate Refresh rate in Hz to pin the physical target to
@@ -62,6 +65,16 @@ BOOL VDMNativePixelSize(CGDirectDisplayID displayID,
 - (BOOL)mirrorDisplay:(CGDirectDisplayID)sourceDisplayID
             toDisplay:(CGDirectDisplayID)targetDisplayID
                atRate:(double)refreshRate;
+
+/// Reassert native physical output without rebuilding the mirror or changing
+/// the source desktop. Returns whether the configuration request succeeded.
+- (BOOL)pinNativeModeForDisplay:(CGDirectDisplayID)displayID atRate:(double)refreshRate;
+
+/// Keep Dock on our virtual source when an inactive, mirrored physical display
+/// incorrectly captures the desktop edge. Only applies to a single active
+/// desktop. Uses a bounded, asynchronous request; display modes are unchanged.
+- (void)repairDockPlacementForSource:(CGDirectDisplayID)sourceDisplayID
+                  mirroredToDisplay:(CGDirectDisplayID)targetDisplayID;
 
 /// Stop mirroring for a display
 /// @param displayID The display to stop mirroring
@@ -109,7 +122,7 @@ BOOL VDMNativePixelSize(CGDirectDisplayID displayID,
                                        refreshRate:(double)refreshRate
                               matchingDisplay:(CGDirectDisplayID)targetDisplayID;
 
-#pragma mark - HDR control (Beta)
+#pragma mark - Physical HDR and output color
 
 /// Whether a physical display advertises HDR capability.
 /// Apply HDR to the PHYSICAL mirror target, not the virtual display — the
@@ -123,6 +136,19 @@ BOOL VDMNativePixelSize(CGDirectDisplayID displayID,
 /// which keeps the System Settings "High Dynamic Range" checkbox in sync.
 /// Returns YES on success.
 - (BOOL)setHDREnabled:(BOOL)enabled forDisplay:(CGDirectDisplayID)displayID;
+
+/// Link formats for the CURRENT physical timing, plus the current format.
+/// A format contains bitsPerComponent, range (0 limited / 1 full), eotf
+/// (0 SDR / 2 HDR10), and encoding (0 RGB / 1 YCbCr444 / 2 YCbCr422 / 3 YCbCr420).
+/// These describe the display link, not the desktop framebuffer's pixel format.
+/// Returns nil if this OS/display does not expose the required private APIs.
+- (nullable NSDictionary<NSString *, id> *)outputStateForDisplay:(CGDirectDisplayID)displayID;
+
+/// Select an exact enumerated link format without changing the physical timing,
+/// mirroring or desktop scale. Re-enumerates before applying; unsupported
+/// combinations are rejected. Success means accepted, so callers must read back.
+- (BOOL)setOutputMode:(NSDictionary<NSString *, NSNumber *> *)mode
+          forDisplay:(CGDirectDisplayID)displayID;
 
 @end
 
