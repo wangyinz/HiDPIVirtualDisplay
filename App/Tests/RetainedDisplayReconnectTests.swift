@@ -24,12 +24,12 @@ import Foundation
 
         recovery = gate()
         check(recovery.observe(desktop: desktop, capabilities: nil, physicalPresent: true, at: 0) == .waiting, "EDID absent on present target still polls")
-        check(recovery.observe(desktop: desktop, capabilities: nil, physicalPresent: true, at: 30) == .rebuild, "Present target with absent EDID has bounded fallback")
+        check(recovery.observe(desktop: desktop, capabilities: nil, physicalPresent: true, at: 30) == .unavailable, "Present target with absent EDID pauses without destroying its desktop")
         recovery = gate()
         for t in [0.0, 1, 10, 29] {
             check(recovery.observe(desktop: desktop, capabilities: degraded, physicalPresent: true, at: t) == .waiting, "Do not accept30Hz")
         }
-        check(recovery.observe(desktop: desktop, capabilities: degraded, physicalPresent: true, at: 30) == .rebuild, "Bounded cold-rebuild fallback")
+        check(recovery.observe(desktop: desktop, capabilities: degraded, physicalPresent: true, at: 30) == .unavailable, "Missing native timing pauses without forcing another process")
 
         recovery = gate()
         _ = recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 0)
@@ -58,6 +58,59 @@ import Foundation
         check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 602) == .ready, "A real disconnect starts a new bounded link attempt")
         recovery.resetProbe()
         check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 1000) == .waiting, "Wake resets previous deadline")
+        // Real failure regression: the main run loop delivers a configuration
+        // notification from inside CGCompleteDisplayConfiguration. It must not
+        // detach or mirror the target a second time before the first pin returns.
+        let operation = RetainedReconnectOperation()
+        var transactions = 0
+        var detachments = 0
+        var outerFinished = false
+        func notification() {
+            operation.performIfIdle { detachments += 1; transactions += 1 }
+        }
+        check(operation.performIfIdle {
+            transactions += 1
+            notification()
+            check(operation.isRunning && !outerFinished, "Outer transaction owns nested notifications")
+            outerFinished = true
+        }, "Outer mirror transaction starts")
+        check(transactions == 1 && detachments == 0 && outerFinished, "No reentrant detach/mirror during CoreGraphics transaction")
+        check(!operation.isRunning, "Operation gate releases after synchronous transaction")
+        notification()
+        check(transactions == 2 && detachments == 1, "Later independent notification can run")
+
+        func verifier() -> RetainedMirrorVerification {
+            .init(targetDisplayID: 2, desktop: desktop, startedAt: 0)
+        }
+        var verification = verifier()
+        let placeholderIsNative = requirement.matchesPhysical(width: 1, height: 1,
+            pixelWidth: 1, pixelHeight: 1, refreshRate: 60, variableRefresh: false)
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: placeholderIsNative, at: 0.5) == .waiting,
+              "Temporary 1x1 readback does not cause immediate teardown")
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 1) == .waiting, "First good post-transaction readback")
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 1.5) == .waiting, "Second readback still waits")
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 2) == .ready, "Three good readbacks over one second finish recovery")
+        verification = verifier()
+        _ = verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 0)
+        _ = verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: false, at: 0.5)
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 1) == .waiting, "Unstable physical readback resets stability")
+        check(verification.observe(desktop: nil, mirrorMatches: true, physicalMatches: true, at: 5) == .failed, "Missing source after deadline requires bounded recovery")
+        verification = verifier()
+        check(verification.observe(desktop: desktop, mirrorMatches: false, physicalMatches: true, at: 5) == .failed, "Missing mirror fails verification")
+        verification = verifier()
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: false, at: 5) == .failed, "Persistent scaled physical coordinates fail verification")
+        verification = verifier()
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 6) == .failed, "Late good readback does not bypass deadline")
+
+        recovery = gate()
+        _ = recovery.observe(desktop: desktop, capabilities: degraded, physicalPresent: true, at: 0)
+        _ = recovery.observe(desktop: desktop, capabilities: degraded, physicalPresent: true, at: 30)
+        check(recovery.observe(desktop: desktop, capabilities: degraded, physicalPresent: true, at: 600) == .unavailable, "Same 30Hz link remains paused without repeated timeout cycles")
+        let stillDegraded = DisplayLinkCapabilities(displayID: 2, width: 7680, height: 4320, fixedRefreshRates: [24, 25, 30])
+        check(recovery.observe(desktop: desktop, capabilities: stillDegraded, physicalPresent: true, at: 601) == .unavailable, "Unrelated changes in insufficient rates do not restart polling")
+        check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 602) == .waiting, "60Hz becoming available starts a new stability check")
+        _ = recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 603)
+        check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 604) == .ready, "Recover same retained source when bandwidth returns")
         print("Retained reconnect passed (\(checks) checks)")
     }
 }

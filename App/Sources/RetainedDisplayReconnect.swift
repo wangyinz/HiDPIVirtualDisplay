@@ -21,17 +21,21 @@ struct RetainedDesktopSignature: Equatable {
 /// Retaining an owned virtual display is independent from accepting the link.
 /// Time spent on the other computer does not consume the 30-second link probe.
 struct RetainedDisplayReconnect {
-    enum Decision: Equatable { case disconnected, waiting, ready, rebuild }
+    enum Decision: Equatable { case disconnected, waiting, ready, unavailable, rebuild }
     let desktop: RetainedDesktopSignature
     let requirement: DisplayTimingRequirement
     private var readiness = DisplayConnectionReadiness()
+    private var linkUnavailable = false
 
     init(desktop: RetainedDesktopSignature, requirement: DisplayTimingRequirement) {
         self.desktop = desktop
         self.requirement = requirement
     }
 
-    mutating func resetProbe() { readiness = DisplayConnectionReadiness() }
+    mutating func resetProbe() {
+        readiness = DisplayConnectionReadiness()
+        linkUnavailable = false
+    }
 
     mutating func observe(desktop current: RetainedDesktopSignature?,
                           capabilities: DisplayLinkCapabilities?, physicalPresent: Bool, at now: TimeInterval) -> Decision {
@@ -40,10 +44,62 @@ struct RetainedDisplayReconnect {
             resetProbe()
             return .disconnected
         }
+        if linkUnavailable {
+            guard let capabilities = capabilities, requirement.accepts(capabilities) else { return .unavailable }
+            resetProbe()
+        }
         switch readiness.observe(capabilities, requiring: requirement, at: now) {
         case .waiting: return .waiting
         case .ready: return .ready
-        case .timedOut: return .rebuild
+        case .timedOut:
+            linkUnavailable = true
+            return .unavailable
         }
+    }
+}
+
+/// CoreGraphics display transactions can pump the main run loop before returning.
+/// A main-queue notification must not start a second transaction inside the first.
+final class RetainedReconnectOperation {
+    private(set) var isRunning = false
+
+    @discardableResult
+    func performIfIdle(_ operation: () -> Void) -> Bool {
+        guard !isRunning else { return false }
+        isRunning = true
+        defer { isRunning = false }
+        operation()
+        return true
+    }
+}
+
+/// A successful CoreGraphics transaction can briefly read back a placeholder
+/// mode (observed as 1x1). Verify asynchronously without applying another mode.
+struct RetainedMirrorVerification {
+    enum Decision { case waiting, ready, failed }
+    let targetDisplayID: UInt32
+    let desktop: RetainedDesktopSignature
+    let startedAt: TimeInterval
+    private var stableSince: TimeInterval?
+    private var samples = 0
+
+    init(targetDisplayID: UInt32, desktop: RetainedDesktopSignature, startedAt: TimeInterval) {
+        self.targetDisplayID = targetDisplayID
+        self.desktop = desktop
+        self.startedAt = startedAt
+    }
+
+    mutating func observe(desktop current: RetainedDesktopSignature?,
+                          mirrorMatches: Bool, physicalMatches: Bool, at now: TimeInterval) -> Decision {
+        if now - startedAt > 5 { return .failed }
+        if desktop.matches(current) && mirrorMatches && physicalMatches {
+            if stableSince == nil { stableSince = now }
+            samples += 1
+            if samples >= 3, let since = stableSince, now - since >= 1 { return .ready }
+        } else {
+            stableSince = nil
+            samples = 0
+        }
+        return now - startedAt >= 5 ? .failed : .waiting
     }
 }

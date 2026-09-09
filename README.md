@@ -2,7 +2,7 @@
 
 This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
 right-edge Dock repair, persistent physical HDR/color output, and guarded HDMI
-reconnection. Current local experimental build: **8.15** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
+reconnection. Current local experimental build: **8.16** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
 below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -56,7 +56,7 @@ Click the display icon in your menu bar, pick your monitor, pick a resolution pr
 
 Every monitor submenu has a **Custom Scale...** option — it opens a slider for any factor between 1.1x and 2.0x. The resolution preview updates as you drag.
 
-### Faster HDMI switching (build 8.15)
+### Faster HDMI switching (build 8.16)
 
 **Settings → Keep Virtual Display During HDMI Switch** is opt-in and requires
 Auto-Apply on Reconnect. When the bound monitor disappears and no other real
@@ -69,8 +69,10 @@ Otherwise it reattaches the same virtual source. It checks the source ID,
 logical/backing dimensions and refresh rate, plus physical native 1:1 geometry
 and fixed refresh, before resuming HDR/color and Dock restoration. Stale
 scaled target coordinates are detached while waiting. A missing or changed
-source, an unready link after 30 seconds, or a failed mirror falls back to the
-bounded full-recovery path.
+source or a failed mirror falls back to the bounded full-recovery path.
+If the native timing remains unavailable for 30 seconds, the helper pauses
+while retaining the source and process; it resumes the stability check when
+the requested timing becomes available or the monitor reconnects.
 
 Time spent on the other computer does not consume the returning-link timeout;
 there is no active capability polling while the monitor is absent. If the
@@ -81,9 +83,17 @@ cancel pending retained recovery.
 
 This avoids the previous 12-second disconnect teardown, process relaunch and
 virtual-screen creation on normal switch cycles. HDMI link negotiation and
-required display-mode changes may still blank the TV. Real switch timing is
-being validated; 26 retention tests, 30 existing readiness assertions, HDR
-preference tests and the universal build/signature pass.
+required display-mode changes may still blank the TV. A long switch test of 8.15
+retained the source for about 11 minutes, but exposed reentrant mirror
+transactions during CoreGraphics callbacks. Build 8.16 serializes this path
+and verifies the resulting geometry with three asynchronous readbacks over
+one second (five-second limit), so transient 1×1 readback does not trigger an
+immediate teardown. It logs the first returning mode and native rates.
+
+On that test, the connection eventually offered only 8K 24/25/30Hz and SDR
+to a fresh process. Another HDMI switch restored 8K60 and HDR. Software cannot
+select a timing absent from the current link; the cause of the link downgrade
+remains unconfirmed. The 8.16 real-switch test is pending.
 
 ### Experimental virtual refresh (build 8.14)
 

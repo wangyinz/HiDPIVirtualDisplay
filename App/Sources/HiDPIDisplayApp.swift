@@ -681,6 +681,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var retainedReconnect: RetainedDisplayReconnect?
     private var retainedReconnectWorkItem: DispatchWorkItem?
     private var retainedReconnectStartedAt: TimeInterval?
+    private let retainedReconnectOperation = RetainedReconnectOperation()
+    private var retainedMirrorVerification: RetainedMirrorVerification?
     private let kVirtualRefreshPolicyKey = "experimentalVirtualRefreshMultiplier"
     private let kCompositionBudgetKey = "experimentalCompositionBudgetMS"
     private let kRefreshRateKey = "customRefreshRate"  // 0.0 = auto-detect
@@ -895,6 +897,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             debugLog(">>> Screens did sleep — deferring disconnect handling")
             self?.screensAsleep = true
             self?.retainedReconnect?.resetProbe()
+            self?.retainedMirrorVerification = nil
             self?.beginOutputRestore()
         }
 
@@ -1025,6 +1028,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if retainedReconnect != nil {
             retainedReconnect?.resetProbe()
+            retainedMirrorVerification = nil
             _ = handleRetainedDisplayConnection()
             return
         }
@@ -1432,6 +1436,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         retainedReconnectWorkItem = nil
         retainedReconnect = nil
         retainedReconnectStartedAt = nil
+        retainedMirrorVerification = nil
     }
 
     private func ownedDesktopSignature() -> RetainedDesktopSignature? {
@@ -1467,6 +1472,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// when a laptop/other real screen is in use.
     @discardableResult
     private func handleRetainedDisplayConnection() -> Bool {
+        if retainedReconnectOperation.isRunning { return true }
         guard !isSettingUp, !isRestarting, !screensAsleep else { return retainedReconnect != nil }
         let target = boundPhysicalDisplay()
         if retainedReconnect != nil {
@@ -1484,7 +1490,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 cleanupAfterDisconnect()
                 return true
             }
-            guard ownedDesktopSignature() != nil else {
+            guard retainedMirrorVerification != nil || ownedDesktopSignature() != nil else {
                 clearRetainedReconnect()
                 suspendMirrorForConnection("Retained virtual display no longer exists")
                 return true
@@ -1518,13 +1524,65 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func checkRetainedMirror() {
+        retainedReconnectOperation.performIfIdle { advanceRetainedMirror() }
+    }
+
+    private func scheduleRetainedMirrorCheck(after delay: TimeInterval = 1) {
+        retainedReconnectWorkItem?.cancel()
+        let generation = setupGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, generation == self.setupGeneration else { return }
+            self.retainedReconnectWorkItem = nil
+            self.checkRetainedMirror()
+        }
+        retainedReconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func advanceRetainedMirror() {
         guard var recovery = retainedReconnect, !isRestarting, !isSettingUp, !screensAsleep else { return }
+        let generation = setupGeneration
         let target = boundPhysicalDisplay()
         let now = ProcessInfo.processInfo.systemUptime
         let capabilities = target.flatMap { linkCapabilities(for: $0) }
+        if var verification = retainedMirrorVerification {
+            guard let target = target, target == verification.targetDisplayID else {
+                retainedMirrorVerification = nil
+                retainedReconnectStartedAt = nil
+                recovery.resetProbe()
+                retainedReconnect = recovery
+                if target != nil { scheduleRetainedMirrorCheck() }
+                return
+            }
+            let decision = verification.observe(desktop: ownedDesktopSignature(),
+                mirrorMatches: CGDisplayMirrorsDisplay(target) == currentVirtualID,
+                physicalMatches: physicalTimingMatches(target, requirement: recovery.requirement), at: now)
+            retainedMirrorVerification = verification
+            switch decision {
+            case .waiting:
+                scheduleRetainedMirrorCheck(after: 0.5)
+            case .failed:
+                logRetainedLinkState(target, label: "verification failed")
+                clearRetainedReconnect()
+                suspendMirrorForConnection("Retained mirror did not settle to the required source/native geometry")
+            case .ready:
+                let elapsed = now - (retainedReconnectStartedAt ?? now)
+                debugLog(String(format: "Retained desktop: restored virtual %u without recreating it (reconnect %.2fs)", currentVirtualID, elapsed))
+                clearRetainedReconnect()
+                wasDisconnected = false
+                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+                connectionRecoveryMessage = nil
+                connectionRecoveryBlocked = false
+                rememberStableTiming(recovery.requirement, for: target)
+                reassertPreferencesAfterSetup()
+                rebuildMenu()
+            }
+            return
+        }
         if target != nil && retainedReconnectStartedAt == nil {
             retainedReconnectStartedAt = now
             debugLog("Retained desktop: monitor returned; validating native timing")
+            logRetainedLinkState(target!, label: "first return")
         }
         // macOS can automatically restore a mirror with stale scaled coordinates.
         // Detach only that invalid target while waiting, keeping the virtual
@@ -1536,6 +1594,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 suspendMirrorForConnection("Could not detach stale retained mirror coordinates")
                 return
             }
+            guard generation == setupGeneration, retainedReconnect != nil, !isRestarting else { return }
             debugLog("Retained desktop: detached stale target coordinates while waiting for native timing")
         }
         let decision = recovery.observe(desktop: ownedDesktopSignature(), capabilities: capabilities,
@@ -1550,6 +1609,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             clearRetainedReconnect()
             suspendMirrorForConnection("Retained desktop or returning link failed validation")
             return
+        case .unavailable:
+            let message = "\(recovery.requirement.title) unavailable; virtual desktop kept. Reconnect HDMI to retry."
+            if connectionRecoveryMessage != message {
+                connectionRecoveryMessage = message
+                if let target = target { logRetainedLinkState(target, label: "native timing unavailable") }
+                debugLog("Retained desktop: link probe paused; preserving source and process")
+                rebuildMenu()
+            }
+            // Notifications and the periodic backstop can resume when 60Hz is
+            // offered again. Missing bandwidth does not justify a new desktop.
+            return
         case .waiting:
             break
         case .ready:
@@ -1558,36 +1628,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             targetExternalDisplayID = target
             prepareOutputPreference(for: target)
             let alreadyMirrored = CGDisplayMirrorsDisplay(target) == currentVirtualID
+            logRetainedLinkState(target, label: "before mirror transaction")
             let ok = alreadyMirrored
                 ? manager.pinNativeMode(forDisplay: target, atRate: recovery.requirement.refreshRate)
                 : manager.mirrorDisplay(currentVirtualID, toDisplay: target, atRate: recovery.requirement.refreshRate)
-            guard ok, CGDisplayMirrorsDisplay(target) == currentVirtualID,
-                  recovery.desktop.matches(ownedDesktopSignature()),
-                  physicalTimingMatches(target, requirement: recovery.requirement) else {
+            guard generation == setupGeneration, retainedReconnect != nil, !isRestarting else { return }
+            guard ok else {
                 clearRetainedReconnect()
-                suspendMirrorForConnection("Retained mirror failed native/cursor geometry verification")
+                suspendMirrorForConnection("Retained mirror transaction failed")
                 return
             }
-            let elapsed = ProcessInfo.processInfo.systemUptime - (retainedReconnectStartedAt ?? now)
-            debugLog(String(format: "Retained desktop: restored virtual %u without recreating it (reconnect %.2fs, alreadyMirrored=%d)", currentVirtualID, elapsed, alreadyMirrored ? 1 : 0))
-            clearRetainedReconnect()
-            wasDisconnected = false
-            UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-            connectionRecoveryMessage = nil
-            connectionRecoveryBlocked = false
-            rememberStableTiming(recovery.requirement, for: target)
-            reassertPreferencesAfterSetup()
-            rebuildMenu()
+            logRetainedLinkState(target, label: "transaction returned; awaiting readback")
+            retainedMirrorVerification = RetainedMirrorVerification(targetDisplayID: target,
+                desktop: recovery.desktop, startedAt: ProcessInfo.processInfo.systemUptime)
+            scheduleRetainedMirrorCheck(after: 0.5)
             return
         }
-        let generation = setupGeneration
-        let work = DispatchWorkItem { [weak self] in
-            guard let self = self, generation == self.setupGeneration else { return }
-            self.retainedReconnectWorkItem = nil
-            self.checkRetainedMirror()
-        }
-        retainedReconnectWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+        scheduleRetainedMirrorCheck()
+    }
+
+    private func logRetainedLinkState(_ target: CGDirectDisplayID, label: String) {
+        let capabilities = linkCapabilities(for: target)
+        let rates = capabilities?.fixedRefreshRates.map { String(format: "%.1f", $0) }.joined(separator: ",") ?? "unavailable"
+        let mode = CGDisplayCopyDisplayMode(target)
+        let timing = mode.map { "\($0.width)x\($0.height) / \($0.pixelWidth)x\($0.pixelHeight) @ \($0.refreshRate)" } ?? "unavailable"
+        let source = ownedDesktopSignature()
+        debugLog("Retained desktop [\(label)]: target=\(target), native rates=[\(rates)], physical=\(timing), mirror=\(CGDisplayMirrorsDisplay(target)), source=\(String(describing: source))")
     }
 
     /// The monitor can vanish from the display list for a few seconds without
@@ -2986,7 +3052,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func shouldRetryConnection(on target: CGDirectDisplayID?) -> Bool {
         guard connectionRecoveryBlocked else { return true }
         let capabilities = target.flatMap { linkCapabilities(for: $0) }
-        guard capabilities != blockedConnectionCapabilities else { return false }
+        guard let target = target, let capabilities = capabilities,
+              let requirement = requiredTiming(for: target), requirement.accepts(capabilities),
+              capabilities != blockedConnectionCapabilities else { return false }
         connectionRecoveryBlocked = false
         return true
     }
@@ -3018,7 +3086,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             outputRestore.finish()
             connectionRecoveryBlocked = true
             blockedConnectionCapabilities = capabilities
-            connectionRecoveryMessage = "Connection not ready; select a preset to retry."
+            connectionRecoveryMessage = requirement.map { "\($0.title) unavailable; reconnect HDMI or select a preset to retry." }
+                ?? "Display capabilities unavailable; reconnect HDMI to retry."
             wasDisconnected = true
             UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
             debugLog("Connection probe stopped after 30s; native desktop retained, no virtual display created")
