@@ -83,6 +83,10 @@ import Foundation
             .init(targetDisplayID: 2, desktop: desktop, startedAt: 0)
         }
         var verification = verifier()
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 0) == .waiting, "Immediate good transaction readback does not skip verification")
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 0.5) == .waiting, "Two good samples are insufficient")
+        check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: true, at: 1) == .ready, "Immediate first readback still requires three samples over one second")
+        verification = verifier()
         let placeholderIsNative = requirement.matchesPhysical(width: 1, height: 1,
             pixelWidth: 1, pixelHeight: 1, refreshRate: 60, variableRefresh: false)
         check(verification.observe(desktop: desktop, mirrorMatches: true, physicalMatches: placeholderIsNative, at: 0.5) == .waiting,

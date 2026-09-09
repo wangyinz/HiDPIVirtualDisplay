@@ -2,7 +2,7 @@
 
 This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
 right-edge Dock repair, persistent physical HDR/color output, and guarded HDMI
-reconnection. Current local experimental build: **8.16** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
+reconnection. Current local experimental build: **8.17** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
 below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -56,7 +56,7 @@ Click the display icon in your menu bar, pick your monitor, pick a resolution pr
 
 Every monitor submenu has a **Custom Scale...** option — it opens a slider for any factor between 1.1x and 2.0x. The resolution preview updates as you drag.
 
-### Faster HDMI switching (build 8.16)
+### Faster HDMI switching (build 8.17)
 
 **Settings → Keep Virtual Display During HDMI Switch** is opt-in and requires
 Auto-Apply on Reconnect. When the bound monitor disappears and no other real
@@ -93,7 +93,28 @@ immediate teardown. It logs the first returning mode and native rates.
 On that test, the connection eventually offered only 8K 24/25/30Hz and SDR
 to a fresh process. Another HDMI switch restored 8K60 and HDR. Software cannot
 select a timing absent from the current link; the cause of the link downgrade
-remains unconfirmed. The 8.16 real-switch test is pending.
+remains unconfirmed.
+
+A subsequent 8.16 switch kept the same virtual display and process for about
+four minutes and recovered successfully with one mirror transaction. The user
+reported normal output but a long wait. Software timestamps showed about ten
+seconds from initial 4K120 reporting to 8K60 reporting, then seven seconds to
+verified mirror recovery and four more to confirmed HDR. These are software
+milestones, not TV-visible latency measurements. Dock repair runs asynchronously;
+its logged timeout did not block HDR.
+
+Build 8.17 takes the first geometry sample immediately after the transaction
+(while still requiring three samples over one second) and starts saved HDR
+restoration as soon as that verification passes, bypassing a redundant 1.5-second
+debounce. The normal bounded fixed-refresh/HDR readback remains in place. This
+removes about two seconds of scheduled waiting from the retained path; it does
+not bypass the HDMI capability/stability gate or force absent 8K60 modes.
+
+Build 8.17 passed 47 recovery checks, 30 connection-readiness assertions, HDR
+preference tests and universal build/signature checks. A controlled mirror
+detachment restored the same source and process with correct 8K60/90Hz HiDPI
+and HDR after about 6.8 seconds. This tests the software repair path, not the
+HDMI switch handshake or end-to-end visible latency.
 
 ### Experimental virtual refresh (build 8.14)
 

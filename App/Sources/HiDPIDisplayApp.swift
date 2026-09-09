@@ -1575,6 +1575,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 connectionRecoveryBlocked = false
                 rememberStableTiming(recovery.requirement, for: target)
                 reassertPreferencesAfterSetup()
+                // This path has already verified native fixed timing for a
+                // full second. Start HDR now; the normal delayed check remains
+                // responsible for verifying its result and any VRR correction.
+                restoreOutputPreferenceIfNeeded()
                 rebuildMenu()
             }
             return
@@ -1639,8 +1643,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             logRetainedLinkState(target, label: "transaction returned; awaiting readback")
-            retainedMirrorVerification = RetainedMirrorVerification(targetDisplayID: target,
-                desktop: recovery.desktop, startedAt: ProcessInfo.processInfo.systemUptime)
+            let verificationStartedAt = ProcessInfo.processInfo.systemUptime
+            var verification = RetainedMirrorVerification(targetDisplayID: target,
+                desktop: recovery.desktop, startedAt: verificationStartedAt)
+            _ = verification.observe(desktop: ownedDesktopSignature(),
+                mirrorMatches: CGDisplayMirrorsDisplay(target) == currentVirtualID,
+                physicalMatches: physicalTimingMatches(target, requirement: recovery.requirement),
+                at: verificationStartedAt)
+            retainedMirrorVerification = verification
             scheduleRetainedMirrorCheck(after: 0.5)
             return
         }
