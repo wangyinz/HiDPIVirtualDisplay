@@ -696,10 +696,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Track if we're waiting for monitor reconnection
     private var wasDisconnected = false
 
-    // Cache for skipping redundant display enumeration
-    private var lastDisplayCount: UInt32 = 0
-    private var lastRealMonitorID: CGDirectDisplayID = 0
-
     // Track if we're in the middle of setting up HiDPI (don't trigger cleanup during setup)
     private var isSettingUp = false
     private var isRestarting = false
@@ -710,6 +706,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // restore, reconnect restore, or manual apply from firing a stale
     // performMirror with display IDs that no longer exist.
     private var setupGeneration = 0
+    private var connectionReadiness = DisplayConnectionReadiness()
+    private var connectionReadinessGeneration = -1
+    private var connectionRecoveryMessage: String?
+    private var connectionRecoveryBlocked = false
+    private var blockedConnectionCapabilities: DisplayLinkCapabilities?
+    private var mirrorReattachWorkItem: DispatchWorkItem?
+    private var setupTimingRequirement: DisplayTimingRequirement?
+    private let kStableTimingKey = "lastStableDisplayTimingV1"
+    private let kConnectionRecoveryCountKey = "consecutiveConnectionRecoveries"
 
     // A disconnect confirmation pass is scheduled (debounce for transient
     // dropouts like DP link retraining on wake or monitor power-cycling).
@@ -777,10 +782,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Restore wasDisconnected state from UserDefaults (persists across restart)
         wasDisconnected = UserDefaults.standard.bool(forKey: kWasDisconnectedKey)
         debugLog("Restored wasDisconnected state: \(wasDisconnected)")
+        if UserDefaults.standard.integer(forKey: kConnectionRecoveryCountKey) > 3 {
+            wasDisconnected = false
+            UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+            UserDefaults.standard.set(false, forKey: kWasCrashKey)
+            connectionRecoveryMessage = "Connection recovery paused; select a preset to retry."
+        }
 
         // Capture the initial HDR choice before cleanup can reset the link.
         // Existing per-monitor preferences always win over reconnect defaults.
-        if let physical = findExternalDisplay() { prepareOutputPreference(for: physical) }
+        if let physical = findExternalDisplay() {
+            prepareOutputPreference(for: physical)
+            rememberUnmirroredNativeTiming(physical)
+        }
 
         // Clean up any stale state from previous sessions
         cleanupStaleState()
@@ -892,6 +906,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         debugLog("Display change monitoring started (notification + timer + wake + screen sleep)")
+        // The monitor may already be back before the cleanup process restarts;
+        // a new notification is not guaranteed. Start the readiness check now.
+        if wasDisconnected {
+            DispatchQueue.main.async { [weak self] in self?.handleDisplayConfigurationChange() }
+        }
     }
 
     func stopDisplayChangeMonitoring() {
@@ -920,6 +939,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         fixedRefreshWorkItem?.cancel()
         fixedRefreshWorkItem = nil
+        mirrorReattachWorkItem?.cancel()
+        mirrorReattachWorkItem = nil
         displayCheckTimer?.invalidate()
         displayCheckTimer = nil
         debugLog("Display change monitoring stopped")
@@ -932,24 +953,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // HDR may change the output timing without changing the display count.
         scheduleFixedRefreshCheck()
 
-        // Skip if nothing changed since last check
-        var rawDisplayList = [CGDirectDisplayID](repeating: 0, count: 32)
-        var currentDisplayCount: UInt32 = 0
-        CGGetOnlineDisplayList(32, &rawDisplayList, &currentDisplayCount)
-
-        if isActive && currentDisplayCount == lastDisplayCount && lastRealMonitorID != 0 {
-            return
-        }
-
+        // HDMI hotplug can reuse both the display ID and the display count.
+        // Recheck the real target and mirror even when the count is unchanged.
         let realMonitor = findRealPhysicalMonitor()
-
-        lastDisplayCount = currentDisplayCount
-        lastRealMonitorID = realMonitor ?? 0
 
         // Case 1: HiDPI active but monitor disconnected
         if isActive && realMonitor == nil {
             debugLog(">>> Periodic check: Physical monitor gone - confirming before cleanup")
             scheduleDisconnectConfirmation()
+            return
+        }
+
+        if isActive && realMonitor != nil {
+            ensureMirrorIntact()
             return
         }
 
@@ -960,6 +976,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             scheduleDisconnectConfirmation()
             return
         }
+
+        // A timed-out capability probe remains idle until the link changes or
+        // the user explicitly retries. Do not repeat setup every 30 seconds.
+        if !isActive && !shouldRetryConnection(on: realMonitor) { return }
 
         // Case 2: HiDPI not active, monitor reconnected, auto-apply enabled
         if !isActive && wasDisconnected && realMonitor != nil {
@@ -1053,6 +1073,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        if mirrorReattachWorkItem != nil || isRestarting {
+            isSettingUp = false
+            return
+        }
+
         // Case 3: virtual display gone (or re-mirror failed) — full rebuild.
         debugLog(">>> Wake: full rebuild required, restoring preset: \(preset)")
         UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
@@ -1092,16 +1117,79 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CGDisplayMirrorsDisplay(physical) == currentVirtualID {
             return true
         }
-        debugLog("Mirror link broken — re-attaching \(currentVirtualID) -> \(physical) without rebuild")
+        guard mirrorReattachWorkItem == nil else { return false }
+        guard let requirement = requiredTiming(for: physical),
+              let capabilities = linkCapabilities(for: physical),
+              requirement.accepts(capabilities),
+              let sourceMode = CGDisplayCopyDisplayMode(currentVirtualID),
+              abs(sourceMode.refreshRate - requirement.refreshRate) <= 0.5 else {
+            suspendMirrorForConnection("Connection timing changed during reconnect")
+            return false
+        }
         prepareOutputPreference(for: physical)
         beginOutputRestore()
-        let manager = VirtualDisplayManager.shared()
-        let ok = manager.mirrorDisplay(currentVirtualID, toDisplay: physical, atRate: getDisplayRefreshRate(physical))
-        debugLog("Re-attach mirror result: \(ok)")
-        if ok {
-            targetExternalDisplayID = physical
+        connectionReadiness = DisplayConnectionReadiness()
+        setupGeneration += 1
+        let generation = setupGeneration
+        debugLog("Mirror link broken — waiting for stable native timing before re-attaching")
+        scheduleMirrorReattach(physical: physical, requirement: requirement, generation: generation)
+        return false
+    }
+
+    private func scheduleMirrorReattach(physical: CGDirectDisplayID,
+                                        requirement: DisplayTimingRequirement, generation: Int) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.mirrorReattachWorkItem = nil
+            guard generation == self.setupGeneration, self.isActive, !self.isRestarting,
+                  !self.screensAsleep, self.displayIsOnline(self.currentVirtualID) else { return }
+            let capabilities = self.linkCapabilities(for: physical)
+            guard let capabilities = capabilities, requirement.accepts(capabilities) else {
+                self.suspendMirrorForConnection("Waiting for the previous native timing")
+                return
+            }
+            switch self.connectionReadiness.observe(capabilities, requiring: requirement,
+                                                     at: ProcessInfo.processInfo.systemUptime) {
+            case .waiting:
+                self.scheduleMirrorReattach(physical: physical, requirement: requirement, generation: generation)
+            case .timedOut:
+                self.suspendMirrorForConnection("Connection did not settle")
+            case .ready:
+                let ok = VirtualDisplayManager.shared().mirrorDisplay(
+                    self.currentVirtualID, toDisplay: physical, atRate: requirement.refreshRate)
+                debugLog("Stable mirror re-attach result: \(ok)")
+                if ok {
+                    self.targetExternalDisplayID = physical
+                    self.reassertPreferencesAfterSetup()
+                } else {
+                    self.suspendMirrorForConnection("Mirror timing changed while applying")
+                }
+            }
         }
-        return ok
+        mirrorReattachWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+    }
+
+    /// Release the virtual desktop once, then let the next process wait without
+    /// a hidden/incorrect desktop or stale per-process display mode enumeration.
+    private func suspendMirrorForConnection(_ reason: String) {
+        guard !isRestarting else { return }
+        let attempts = UserDefaults.standard.integer(forKey: kConnectionRecoveryCountKey) + 1
+        UserDefaults.standard.set(attempts, forKey: kConnectionRecoveryCountKey)
+        debugLog("Connection recovery \(attempts)/3: \(reason); releasing mirror before waiting")
+        beginOutputRestore()
+        if attempts <= 3 {
+            wasDisconnected = true
+            cleanupAfterDisconnect()
+        } else {
+            // One final clean restart removes the virtual display but does not
+            // auto-apply again. Only an explicit preset/rate choice resets this.
+            isRestarting = true
+            wasDisconnected = false
+            UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+            UserDefaults.standard.set(false, forKey: kWasCrashKey)
+            relaunchApp()
+        }
     }
 
     /// Settle fixed physical timing first, then restore HDR and the exact link
@@ -1140,19 +1228,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             VirtualDisplayManager.shared().repairDockPlacement(
                 forSource: self.currentVirtualID, mirroredToDisplay: target)
             self.observeManualHDRSelection()
-            let state = VDMVariableRefreshState(target)
-            if state == 0 || state == -1 {
-                if state == 0 { self.fixedRefreshRepairAttempts = 0 }
+            guard let requirement = self.requiredTiming(for: target),
+                  let capabilities = self.linkCapabilities(for: target),
+                  requirement.accepts(capabilities),
+                  let source = CGDisplayCopyDisplayMode(self.currentVirtualID),
+                  abs(source.refreshRate - requirement.refreshRate) <= 0.5 else {
+                self.suspendMirrorForConnection("Native mode or source refresh no longer matches")
+                return
+            }
+            if self.physicalTimingMatches(target, requirement: requirement) {
+                self.fixedRefreshRepairAttempts = 0
+                self.rememberStableTiming(requirement, for: target)
                 self.restoreOutputPreferenceIfNeeded()
                 return
             }
-            guard state == 1 else { return }
             guard self.fixedRefreshRepairAttempts < 3 else {
-                if self.outputRestore.pending {
-                    self.finishOutputRestore(
-                        actualHDR: VirtualDisplayManager.shared().isHDREnabled(forDisplay: target),
-                        message: "Fixed refresh did not hold; color restoration paused.")
-                }
+                self.suspendMirrorForConnection("Physical timing failed verification three times")
                 return
             }
             // A manual HDR change may have enabled VRR. Its stable choice has
@@ -1161,7 +1252,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.outputObservationAfter = Date().timeIntervalSinceReferenceDate + 4
             self.fixedRefreshRepairAttempts += 1
             let ok = VirtualDisplayManager.shared().pinNativeMode(
-                forDisplay: target, atRate: self.getDisplayRefreshRate(target))
+                forDisplay: target, atRate: requirement.refreshRate)
             debugLog("Fixed refresh repair \(self.fixedRefreshRepairAttempts)/3: \(ok)")
             self.scheduleFixedRefreshCheck()
         }
@@ -1203,6 +1294,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Case 2: HiDPI is not active, check if monitor was reconnected
         let realMonitor = findRealPhysicalMonitor(verbose: true)
         if !isActive && realMonitor != nil && wasDisconnected {
+            guard shouldRetryConnection(on: realMonitor) else { return }
             let failCount = UserDefaults.standard.integer(forKey: kMirrorFailureCountKey)
             if failCount >= maxMirrorRetries {
                 debugLog("Display reconnected but mirror failed \(failCount) times, not retrying (apply manually from menu)")
@@ -1338,6 +1430,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.disconnectConfirmationPending = false
                 debugLog("Monitor is back (transient dropout) — verifying mirror instead of cleaning up")
                 if self.isActive && !self.ensureMirrorIntact() {
+                    if self.mirrorReattachWorkItem != nil || self.isRestarting { return }
                     // Virtual display didn't survive the dropout — full restore.
                     if let preset = UserDefaults.standard.string(forKey: self.kLastPresetKey), !preset.isEmpty {
                         debugLog("Mirror unrecoverable after dropout — rebuilding")
@@ -1452,6 +1545,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         debugLog("Disabling HiDPI for disconnect (preserving preset) - currentVirtualID: \(currentVirtualID)")
         setupGeneration += 1  // Cancel any in-flight setup steps
         isSettingUp = false   // A cancelled setup step won't clear this itself
+        mirrorReattachWorkItem?.cancel()
+        mirrorReattachWorkItem = nil
 
         let manager = VirtualDisplayManager.shared()
 
@@ -1609,6 +1704,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func saveCurrentPreset(_ presetName: String) {
+        connectionRecoveryBlocked = false
+        blockedConnectionCapabilities = nil
+        connectionReadinessGeneration = -1
+        connectionRecoveryMessage = nil
         UserDefaults.standard.set(presetName, forKey: kLastPresetKey)
         UserDefaults.standard.set(true, forKey: kWasCrashKey)
         debugLog("Saved preset for crash recovery: \(presetName)")
@@ -1695,6 +1794,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let statusItem = NSMenuItem(title: "No HiDPI active", action: nil, keyEquivalent: "")
             statusItem.isEnabled = false
             menu.addItem(statusItem)
+            menu.addItem(NSMenuItem.separator())
+        }
+
+        if let message = connectionRecoveryMessage {
+            let item = NSMenuItem(title: message, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
             menu.addItem(NSMenuItem.separator())
         }
 
@@ -1980,7 +2086,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               Date().timeIntervalSinceReferenceDate >= outputObservationAfter,
               let target = stableOutputTarget() else { return }
         let manager = VirtualDisplayManager.shared()
-        guard manager.displaySupportsHDR(target) else { return }
+        // A user's HDR toggle can itself enable VRR. Capture that choice
+        // before pinning fixed timing, but still reject reduced-rate or scaled
+        // physical modes seen during an incomplete HDMI reconnect.
+        guard manager.displaySupportsHDR(target),
+              let requirement = requiredTiming(for: target),
+              physicalTimingMatches(target, requirement: requirement,
+                                    requiresFixedRefresh: false) else { return }
         let now = Date().timeIntervalSinceReferenceDate
         let hdr = manager.isHDREnabled(forDisplay: target)
         guard let changed = hdrSelectionObserver.observe(hdr, at: now),
@@ -1999,12 +2111,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               Date().timeIntervalSinceReferenceDate >= outputObservationAfter,
               isActive, displayIsOnline(target), displayIsOnline(currentVirtualID),
               CGDisplayMirrorsDisplay(target) == currentVirtualID,
+              VirtualDisplayManager.shared().displaySupportsHDR(target),
+              outputRestoreMessage == nil,
+              let requirement = requiredTiming(for: target),
+              physicalTimingMatches(target, requirement: requirement),
               var preference = outputPreference(for: target) else { return }
         preference.hdrEnabled = VirtualDisplayManager.shared().isHDREnabled(forDisplay: target)
         saveOutputPreference(preference, for: target)
     }
 
     private func finishOutputRestore(actualHDR: Bool, message: String? = nil) {
+        if let requirement = requiredTiming(for: targetExternalDisplayID),
+           physicalTimingMatches(targetExternalDisplayID, requirement: requirement) {
+            UserDefaults.standard.set(0, forKey: kConnectionRecoveryCountKey)
+        }
         outputRestore.finish()
         forceAutomaticOutput = false
         hdrSelectionObserver.reset(to: actualHDR)
@@ -2261,6 +2381,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let rate = sender.representedObject as? NSNumber else { return }
         let oldRate = UserDefaults.standard.double(forKey: kRefreshRateKey)
         UserDefaults.standard.set(rate.doubleValue, forKey: kRefreshRateKey)
+        UserDefaults.standard.set(0, forKey: kConnectionRecoveryCountKey)
+        connectionRecoveryBlocked = false
         debugLog("Refresh rate set to: \(rate.doubleValue == 0 ? "Auto" : "\(rate.doubleValue) Hz")")
 
         // CGVirtualDisplay objects persist until the process exits, so changing
@@ -2326,7 +2448,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applyCustomConfig(_ config: PresetConfig) {
-        // User manually applying — reset failure counter for fresh attempt
+        // User manually applying — reset failure counters for a fresh attempt.
+        UserDefaults.standard.set(0, forKey: kConnectionRecoveryCountKey)
         UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
         // Save custom config to UserDefaults for crash recovery
         let presetKey = "custom-\(config.logicalWidth)x\(config.logicalHeight)"
@@ -2370,7 +2493,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let presetName = sender.representedObject as? String else { return }
         debugLog(">>> Applying preset: \(presetName)")
 
-        // User manually applying — reset failure counter for fresh attempt
+        // User manually applying — reset failure counters for a fresh attempt.
+        UserDefaults.standard.set(0, forKey: kConnectionRecoveryCountKey)
         UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
 
         guard let config = presetConfigs[presetName] else {
@@ -2418,9 +2542,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func disableHiDPISync() {
         captureHDRBeforeTeardown()
         outputRestore.finish()
+        connectionRecoveryMessage = nil
+        connectionRecoveryBlocked = false
         debugLog("Disabling HiDPI (user action) - currentVirtualID: \(currentVirtualID)")
         setupGeneration += 1  // Cancel any in-flight setup steps
         isSettingUp = false   // A cancelled setup step won't clear this itself
+        mirrorReattachWorkItem?.cancel()
+        mirrorReattachWorkItem = nil
 
         let manager = VirtualDisplayManager.shared()
 
@@ -2445,32 +2573,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         debugLog("HiDPI disabled (preset cleared)")
     }
 
-    /// Find the highest refresh rate the panel supports *at its native pixel
-    /// grid*. More reliable than CGDisplayCopyDisplayMode for "Auto" because the
-    /// current mode can briefly report a transient low rate during the
-    /// teardown/recreate window after a relaunch.
-    ///
-    /// Rates that only exist on smaller modes are deliberately excluded. Taking
-    /// the max across every mode used to pick a rate the panel can only reach by
-    /// shrinking, and the mirror pin would then drop the panel below native to
-    /// reach it. On a bandwidth limited link (HDMI on a base M4 driving a dual
-    /// 4K panel, say) that turned a 120 Hz request into a half-resolution
-    /// desktop the monitor had to upscale.
-    func maxSupportedRefreshRate(_ displayID: CGDirectDisplayID) -> Double {
-        if let best = nativeRefreshRates(displayID).max() {
-            return best
-        }
-
-        // Native size unreadable or it publishes no rate at all (some panels
-        // report 0 Hz for their only mode). Fall back to the old whole-list max.
-        let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
-        guard let modes = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] else {
-            return 60.0
-        }
-        let rates = modes.compactMap { $0.refreshRate > 0 ? $0.refreshRate : nil }
-        return rates.max() ?? 60.0
-    }
-
     /// Every refresh rate the panel offers on its native pixel grid, ascending.
     /// Empty when the native size can't be read or the panel publishes no rate
     /// there, in which case callers keep their pre-1.2.6 behavior.
@@ -2492,44 +2594,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return Array(Set(rates)).sorted()
     }
 
-    /// Get the refresh rate for the virtual display.
-    ///
-    /// Auto = the panel's highest rate at native resolution. A custom rate is
-    /// snapped to one the panel actually offers at native, never merely clamped:
-    /// the same value pins the physical target, so handing back a rate the panel
-    /// doesn't have at native would leave the virtual source and the panel
-    /// running at different rates, which is the uneven pacing the pin exists to
-    /// prevent. When the request falls between two supported rates we snap down,
-    /// since a user who lowered the rate usually did so to stop flicker.
-    func getDisplayRefreshRate(_ displayID: CGDirectDisplayID) -> Double {
-        let maxRate = maxSupportedRefreshRate(displayID)
-        let customRate = UserDefaults.standard.double(forKey: kRefreshRateKey)
-        guard customRate > 0 else {
-            debugLog("Auto: using \(maxRate) Hz, the panel's fastest mode at native resolution")
-            return maxRate
-        }
-
-        let supported = nativeRefreshRates(displayID)
-        guard !supported.isEmpty else {
-            // Native rates unknown, so fall back to the old clamp.
-            if customRate > maxRate + 0.5 {
-                debugLog("Requested \(customRate) Hz exceeds panel max (\(maxRate) Hz), using \(maxRate) Hz")
-                return maxRate
-            }
-            debugLog("Using custom refresh rate: \(customRate) Hz (native rates unknown)")
-            return customRate
-        }
-
-        if let exact = supported.first(where: { abs($0 - customRate) <= 0.5 }) {
-            debugLog("Using custom refresh rate: \(exact) Hz (panel offers \(supported) Hz at native)")
-            return exact
-        }
-
-        let snapped = supported.last(where: { $0 < customRate }) ?? supported[0]
-        debugLog("Requested \(customRate) Hz isn't available at native resolution (panel offers \(supported) Hz), using \(snapped) Hz")
-        return snapped
-    }
-
     /// One-line summary of what the panel offers, written to the log whenever we
     /// set up a mirror. Bug reports about softness or refresh rate are almost
     /// always answered by this line, and asking a reporter to enumerate modes by
@@ -2547,6 +2611,104 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         debugLog("Panel \(displayID): native \(nativeWidth)x\(nativeHeight), rates at native \(atNative) Hz, all rates \(anyRates) Hz")
     }
 
+    private func linkCapabilities(for target: CGDirectDisplayID) -> DisplayLinkCapabilities? {
+        guard displayIsOnline(target), let raw = VDMNativeTimingCapabilities(target),
+              let width = raw["width"] as? NSNumber, let height = raw["height"] as? NSNumber,
+              let rates = raw["fixedRefreshRates"] as? [NSNumber] else { return nil }
+        return DisplayLinkCapabilities(displayID: target, width: width.intValue, height: height.intValue,
+                                       fixedRefreshRates: rates.map(\.doubleValue))
+    }
+
+    private func rememberedTiming(for target: CGDirectDisplayID) -> DisplayTimingRequirement? {
+        let records = UserDefaults.standard.dictionary(forKey: kStableTimingKey) ?? [:]
+        return (records[outputMonitorKey(target)] as? [String: Any])
+            .flatMap(DisplayTimingRequirement.init(dictionary:))
+    }
+
+    private func requiredTiming(for target: CGDirectDisplayID) -> DisplayTimingRequirement? {
+        guard target != 0 else { return nil }
+        return DisplayTimingRequirement.recovering(remembered: rememberedTiming(for: target),
+            capabilities: linkCapabilities(for: target),
+            preferredRate: UserDefaults.standard.double(forKey: kRefreshRateKey))
+    }
+
+    private func physicalTimingMatches(_ target: CGDirectDisplayID,
+                                       requirement: DisplayTimingRequirement,
+                                       requiresFixedRefresh: Bool = true) -> Bool {
+        guard let mode = CGDisplayCopyDisplayMode(target) else { return false }
+        return requirement.matchesPhysical(width: mode.width, height: mode.height,
+            pixelWidth: mode.pixelWidth, pixelHeight: mode.pixelHeight, refreshRate: mode.refreshRate,
+            variableRefresh: VDMVariableRefreshState(target) == 1,
+            requiresFixedRefresh: requiresFixedRefresh)
+    }
+
+    private func rememberStableTiming(_ requirement: DisplayTimingRequirement, for target: CGDirectDisplayID) {
+        guard rememberedTiming(for: target) != requirement else { return }
+        var records = UserDefaults.standard.dictionary(forKey: kStableTimingKey) ?? [:]
+        records[outputMonitorKey(target)] = requirement.dictionary
+        UserDefaults.standard.set(records, forKey: kStableTimingKey)
+        debugLog("Connection: remembered native timing \(requirement.title)")
+    }
+
+    private func rememberUnmirroredNativeTiming(_ target: CGDirectDisplayID) {
+        guard CGDisplayMirrorsDisplay(target) == 0,
+              let requirement = requiredTiming(for: target),
+              let capabilities = linkCapabilities(for: target), requirement.accepts(capabilities),
+              let mode = CGDisplayCopyDisplayMode(target),
+              mode.pixelWidth == requirement.width, mode.pixelHeight == requirement.height,
+              abs(mode.refreshRate - requirement.refreshRate) <= 0.5 else { return }
+        rememberStableTiming(requirement, for: target)
+    }
+
+    private func shouldRetryConnection(on target: CGDirectDisplayID?) -> Bool {
+        guard connectionRecoveryBlocked else { return true }
+        let capabilities = target.flatMap { linkCapabilities(for: $0) }
+        guard capabilities != blockedConnectionCapabilities else { return false }
+        connectionRecoveryBlocked = false
+        return true
+    }
+
+    private func waitForConnection(config: PresetConfig, generation: Int,
+                                   external: CGDirectDisplayID?) -> DisplayTimingRequirement? {
+        if connectionReadinessGeneration != generation {
+            connectionReadinessGeneration = generation
+            connectionReadiness = DisplayConnectionReadiness()
+        }
+        let capabilities = external.flatMap { linkCapabilities(for: $0) }
+        let requirement = external.flatMap { requiredTiming(for: $0) }
+        let decision = connectionReadiness.observe(capabilities, requiring: requirement,
+                                                  at: ProcessInfo.processInfo.systemUptime)
+        if decision == .ready {
+            connectionRecoveryMessage = nil
+            setupTimingRequirement = requirement
+            return requirement
+        }
+        let message = requirement.map { "Waiting for \($0.title) to settle…" } ?? "Waiting for display capabilities…"
+        if connectionRecoveryMessage != message {
+            connectionRecoveryMessage = message
+            debugLog("Connection: \(message)")
+            StatusWindowController.shared.updateStatus(message)
+            rebuildMenu()
+        }
+        if decision == .timedOut {
+            isSettingUp = false
+            outputRestore.finish()
+            connectionRecoveryBlocked = true
+            blockedConnectionCapabilities = capabilities
+            connectionRecoveryMessage = "Connection not ready; select a preset to retry."
+            wasDisconnected = true
+            UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
+            debugLog("Connection probe stopped after 30s; native desktop retained, no virtual display created")
+            StatusWindowController.shared.hide()
+            rebuildMenu()
+            return nil
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.createVirtualDisplayAsync(config: config, generation: generation)
+        }
+        return nil
+    }
+
     func createVirtualDisplayAsync(config: PresetConfig, generation: Int) {
         guard generation == setupGeneration else {
             debugLog("Stale setup (create step) superseded, aborting")
@@ -2554,28 +2716,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         debugLog("Creating virtual display: \(config.width)x\(config.height)")
 
-        StatusWindowController.shared.updateStatus("Detecting external display...")
-
-        guard let externalID = findExternalDisplay() else {
-            debugLog("ERROR: No external display found")
-            isSettingUp = false  // Clear setup flag so reconnect detection works
-            StatusWindowController.shared.updateStatus("No external display found")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                StatusWindowController.shared.hide()
-            }
-            rebuildMenu()
-            return
-        }
-        debugLog("Using external display: \(externalID)")
+        let external = findExternalDisplay()
+        guard let requirement = waitForConnection(config: config, generation: generation, external: external),
+              let externalID = external else { return }
+        debugLog("Using stable external display \(externalID): \(requirement.title)")
         prepareOutputPreference(for: externalID)
         beginOutputRestore()
         logPanelModeSummary(externalID)
-
-        StatusWindowController.shared.updateStatus("Creating virtual display...")
-
-        // Match the physical monitor's refresh rate to prevent flicker
-        let refreshRate = getDisplayRefreshRate(externalID)
-        debugLog("Will create virtual display at \(refreshRate) Hz to match physical monitor")
+        StatusWindowController.shared.updateStatus("Creating virtual display…")
+        let refreshRate = requirement.refreshRate
+        debugLog("Will create virtual display at \(refreshRate) Hz; timing fixed for this setup generation")
 
         // Create virtual display with color primaries matching the physical display.
         // This lets ColorSync use an identity transform instead of doing expensive
@@ -2627,7 +2777,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Pin the physical target to the same rate the virtual was created at,
         // so the panel scans out at the requested rate instead of being left in
         // VRR mode (which can downgrade effective rate and break the cursor).
-        let pinRate = getDisplayRefreshRate(externalID)
+        guard let requirement = setupTimingRequirement,
+              displayIsOnline(virtualID), displayIsOnline(externalID),
+              let capabilities = linkCapabilities(for: externalID), requirement.accepts(capabilities),
+              let source = CGDisplayCopyDisplayMode(virtualID),
+              abs(source.refreshRate - requirement.refreshRate) <= 0.5 else {
+            suspendMirrorForConnection("Connection changed between create and mirror")
+            return
+        }
+        let pinRate = requirement.refreshRate
         let success = manager.mirrorDisplay(virtualID, toDisplay: externalID, atRate: pinRate)
         debugLog("Mirror result: \(success)")
 
@@ -2646,7 +2804,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Verify actual backing scale after display configuration settles
             if config.hiDPI {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                    self?.verifyBackingScale(externalID: externalID, config: config)
+                    guard let self = self, generation == self.setupGeneration,
+                          self.isActive, self.currentVirtualID == virtualID else { return }
+                    self.verifyBackingScale(externalID: externalID, config: config)
                 }
             }
 
@@ -2677,10 +2837,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 debugLog("Mirror failed \(failCount) times, stopping auto-retry. Use menu to apply manually.")
                 StatusWindowController.shared.updateStatus("Setup failed — apply manually from menu")
             }
+            isRestarting = true
+            UserDefaults.standard.set(wasDisconnected, forKey: kWasDisconnectedKey)
+            if !wasDisconnected { UserDefaults.standard.set(false, forKey: kWasCrashKey) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in relaunchApp() }
         }
 
-        // Hide status window after a short delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+        // A superseded setup must not hide a newer connection-wait message.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self = self, generation == self.setupGeneration else { return }
             StatusWindowController.shared.hide()
         }
 
@@ -2731,7 +2896,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         rebuildMenu()
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+        let generation = setupGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, generation == self.setupGeneration else { return }
             StatusWindowController.shared.hide()
         }
     }

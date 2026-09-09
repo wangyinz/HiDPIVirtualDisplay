@@ -227,8 +227,8 @@ static void retainWindowIfNeeded(NSWindow *window) {
         // pick the fallback over the requested rate after some mirror configs,
         // making the virtual render at 60 Hz even when the user asked for 120
         // (the panel scanned at 120 but content only updated 60 times/sec).
-        // The caller is now responsible for clamping the requested rate to a
-        // value the panel actually supports (via maxSupportedRefreshRate).
+        // The caller waits for a stable native physical timing before creating
+        // the virtual source, and uses that same rate through mirror setup.
         NSMutableArray *modes = [NSMutableArray arrayWithObject:_mode];
         _modesArray = [modes retain];
         _settings.modes = _modesArray;
@@ -427,88 +427,53 @@ static NSInteger VDMRefreshPreference(CGDirectDisplayID displayID, CGDisplayMode
     return state < 0 ? 1 : (state == 0 ? 0 : 2);
 }
 
-/// Pick a native physical-output mode independently of the mirror's desktop size.
-///
-/// Resolution wins over refresh rate. Pinning below the native pixel grid to
-/// hit a requested rate makes the monitor rescale everything the mirror sends
-/// it, which costs far more detail than the extra frames are worth. Bandwidth
-/// limited links hit this constantly: a panel that does native at 60 Hz but
-/// only half-height at 120 Hz used to get pinned to the half-height mode.
-///
-/// Order of preference:
-///   1. native pixel grid at the requested rate
-///   2. native pixel grid at its own highest rate
-///   3. largest mode at the requested rate (only if native size is unknown)
-///
-/// Returns NULL if nothing matches. Caller owns the returned mode and must
-/// release it via CGDisplayModeRelease().
+NSDictionary<NSString *, id> *VDMNativeTimingCapabilities(CGDirectDisplayID displayID) {
+    if (!displayID || !CGDisplayIsOnline(displayID)) return nil;
+    CFArrayRef modes = VDMCopyDesktopModes(displayID);
+    if (!modes) return nil;
+    size_t width = 0, height = 0;
+    if (!VDMNativePixelSizeInModes(modes, &width, &height)) {
+        CFRelease(modes);
+        return nil;
+    }
+    NSMutableSet<NSNumber *> *rates = [NSMutableSet set];
+    for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+        CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        if (!CGDisplayModeIsUsableForDesktopGUI(mode) || !VDMIsOneToOne(mode) ||
+            CGDisplayModeGetPixelWidth(mode) != width || CGDisplayModeGetPixelHeight(mode) != height ||
+            VDMModeVariableRefreshState(displayID, mode) == 1) continue;
+        double rate = CGDisplayModeGetRefreshRate(mode);
+        if (isfinite(rate) && rate > 0) [rates addObject:@(rate)];
+    }
+    NSDictionary *result = @{@"width": @(width), @"height": @(height),
+        @"fixedRefreshRates": [[rates allObjects] sortedArrayUsingSelector:@selector(compare:)]};
+    CFRelease(modes);
+    return result;
+}
+
+/// Select the requested native timing exactly. A reconnect temporarily offering
+/// only 30 Hz must not turn a saved 60 Hz mirror into a successful 30 Hz setup.
 static CGDisplayModeRef CopyBestModeAtRate(CGDirectDisplayID displayID, double refreshRate) {
     CFArrayRef modes = VDMCopyDesktopModes(displayID);
     if (!modes) return NULL;
-
     size_t nativeW = 0, nativeH = 0;
-    BOOL haveNative = VDMNativePixelSizeInModes(modes, &nativeW, &nativeH);
-
-    CGDisplayModeRef nativeAtRate = NULL;   // native grid, requested rate
-    CGDisplayModeRef nativeFastest = NULL;  // native grid, highest rate
-    CGDisplayModeRef anyAtRate = NULL;      // last resort: biggest at requested rate
-    double nativeFastestRate = -1;
-    size_t anyAtRatePixels = 0;
-
-    CFIndex count = CFArrayGetCount(modes);
-    for (CFIndex i = 0; i < count; i++) {
+    if (!VDMNativePixelSizeInModes(modes, &nativeW, &nativeH)) {
+        CFRelease(modes);
+        return NULL;
+    }
+    CGDisplayModeRef best = NULL;
+    for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
         CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
-        if (!CGDisplayModeIsUsableForDesktopGUI(mode)) continue;
-        size_t pw = CGDisplayModeGetPixelWidth(mode);
-        size_t ph = CGDisplayModeGetPixelHeight(mode);
-        // Keep the physical target in a one-to-one native mode. With a larger
-        // HiDPI mirror source, a 2x physical mode clipped ordinary and text
-        // cursors on the QN990F. The source still owns the HiDPI desktop.
-        if (!VDMIsOneToOne(mode)) continue;
-
-        double rate = CGDisplayModeGetRefreshRate(mode);
-        BOOL rateMatches = fabs(rate - refreshRate) <= 0.5;
-
-        if (haveNative && pw == nativeW && ph == nativeH) {
-            if (rateMatches && VDMRefreshPreference(displayID, mode) < VDMRefreshPreference(displayID, nativeAtRate)) {
-                nativeAtRate = mode;
-            }
-            // nativeFastestRate is seeded at -1, so a panel that reports 0 Hz
-            // for its native timing still lands here rather than falling
-            // through to a smaller mode.
-            if (rate > nativeFastestRate ||
-                (fabs(rate - nativeFastestRate) < 0.01 &&
-                 VDMRefreshPreference(displayID, mode) < VDMRefreshPreference(displayID, nativeFastest))) {
-                nativeFastestRate = rate;
-                nativeFastest = mode;
-            }
-        }
-
-        if (rateMatches && (pw * ph > anyAtRatePixels ||
-            (pw * ph == anyAtRatePixels &&
-             VDMRefreshPreference(displayID, mode) < VDMRefreshPreference(displayID, anyAtRate)))) {
-            anyAtRatePixels = pw * ph;
-            anyAtRate = mode;
-        }
+        if (!CGDisplayModeIsUsableForDesktopGUI(mode) || !VDMIsOneToOne(mode) ||
+            CGDisplayModeGetPixelWidth(mode) != nativeW || CGDisplayModeGetPixelHeight(mode) != nativeH ||
+            !isfinite(CGDisplayModeGetRefreshRate(mode)) ||
+            fabs(CGDisplayModeGetRefreshRate(mode) - refreshRate) > 0.5 ||
+            VDMModeVariableRefreshState(displayID, mode) == 1) continue;
+        if (VDMRefreshPreference(displayID, mode) < VDMRefreshPreference(displayID, best)) best = mode;
     }
-
-    CGDisplayModeRef best = nativeAtRate;
-    if (!best) best = nativeFastest;
-    if (best && best != nativeAtRate) {
-        NSLog(@"VDM: Panel %u has no %.1f Hz mode at native %zux%zu — keeping native at %.1f Hz "
-              @"instead of dropping resolution", displayID, refreshRate, nativeW, nativeH,
-              CGDisplayModeGetRefreshRate(best));
-    }
-    if (!best && anyAtRate) {
-        NSLog(@"VDM: WARN - Panel %u offers no native-size mode, falling back to largest mode at %.1f Hz",
-              displayID, refreshRate);
-        best = anyAtRate;
-    }
-
-    if (best) {
-        NSLog(@"VDM: Native pin selected mode %u, refresh policy: %@",
-              CGDisplayModeGetIODisplayModeID(best),
-              VDMRefreshPreference(displayID, best) == 0 ? @"fixed (VRR off)" : @"VRR or unknown");
+    if (!best) {
+        NSLog(@"VDM: Requested native %zux%zu @ %.1f Hz is unavailable; deferring instead of downgrading",
+              nativeW, nativeH, refreshRate);
     }
     CGDisplayModeRef retained = best ? (CGDisplayModeRef)CGDisplayModeRetain(best) : NULL;
     CFRelease(modes);
@@ -614,14 +579,17 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
         if (originalMode) CGDisplayModeRelease(originalMode);
         return NO;
     }
-    if (originalMode) CGDisplayModeRelease(originalMode);
-
     // Keep the source's HiDPI desktop, then select the physical native scanout in
     // a separate transaction. Pinning before the mirror is overwritten; combining
     // the two operations in one transaction is rejected on some configurations.
     if (refreshRate > 0 && ![self pinNativeModeForDisplay:targetDisplayID atRate:refreshRate]) {
-        NSLog(@"VDM: WARN - Mirror is active but physical output pin failed");
+        NSLog(@"VDM: Physical timing did not apply; undoing this mirror");
+        [self stopMirroringForDisplay:targetDisplayID];
+        VDMRestorePinnedMode(targetDisplayID, originalMode);
+        if (originalMode) CGDisplayModeRelease(originalMode);
+        return NO;
     }
+    if (originalMode) CGDisplayModeRelease(originalMode);
 
     // The source owns the HiDPI desktop; the target reports native output size.
     NSLog(@"VDM: Mirror target variable-refresh state: %ld (0=fixed, 1=VRR, -1=unknown)",

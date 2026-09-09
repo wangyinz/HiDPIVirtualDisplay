@@ -17,6 +17,10 @@ BOOL VDMNativePixelSize(CGDirectDisplayID displayID,
 /// Current mode refresh policy: 0 = fixed, 1 = variable, -1 = unavailable.
 NSInteger VDMVariableRefreshState(CGDirectDisplayID displayID);
 
+/// Native size and non-VRR refresh rates from the SAME enumeration snapshot.
+/// Used to wait out incomplete HDMI capability negotiation before mirroring.
+NSDictionary<NSString *, id> * _Nullable VDMNativeTimingCapabilities(CGDirectDisplayID displayID);
+
 @interface VirtualDisplayManager : NSObject
 
 /// Shared instance

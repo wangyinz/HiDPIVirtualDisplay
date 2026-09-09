@@ -1,8 +1,8 @@
 # G9 Helper — 8K fork
 
 This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
-right-edge Dock repair, and persistent physical HDR/color output. Current
-local build: **8.7**, based on upstream 1.2.6. Build this fork from source
+right-edge Dock repair, persistent physical HDR/color output, and guarded HDMI
+reconnection. Current local build: **8.8**, based on upstream 1.2.6. Build this fork from source
 below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -82,13 +82,59 @@ On the tested M4 Pro / Samsung QN990F / macOS 26.6.2 connection, native fixed
 4:4:4 or 4:2:0 Limited at 10 bits. RGB Full 12-bit HDR was selected and read
 back without changing the physical 1:1 mode, mirror, or fixed refresh.
 This is OS-reported link format, not a framebuffer bit-depth inference or
-a claim about the panel's native bit depth. Actual unplug/replug verification
-remains a separate hardware check.
+a claim about the panel's native bit depth. Build 8.8 additionally passed one
+actual HDMI switch-away/switch-back cycle, as described below.
 
 These controls use dynamically resolved private SkyLight APIs and are disabled
 or reported unavailable when unsupported. Runtime validation was on Apple
 Silicon; the universal Intel slice was compiled, not hardware-tested.
 Run the focused preference tests with **App/Tests/run-display-output-tests.sh**.
+
+### HDMI reconnect protection (local build 8.8)
+
+An HDMI switch can report the same TV and display ID before its full native
+timings return. On the tested connection, one switch-back exposed only
+8K at 24/25/30 Hz and SDR YCbCr 4:2:0 at 8 bits; a later reconnection restored
+8K at 60 Hz and HDR formats. Build 8.7 silently snapped the saved 60 Hz
+preference to 30 Hz and accepted a fixed-rate mirror as healthy, even when
+the physical coordinate scale was wrong.
+
+Build 8.8 waits for the required native resolution and fixed refresh rate to
+appear in three matching observations spanning at least two seconds before
+creating or reattaching a mirror. Explicit refresh choices are honored exactly;
+Auto retains the previously successful native timing across temporary
+capability loss. The selected source rate stays fixed throughout setup.
+
+A readiness check stops after 30 seconds, keeps the native desktop, and
+shows a retry message in the menu. A changed capability list or explicit
+preset selection can start a new check. An existing mirror with an
+incompatible source rate is released through a clean application restart
+before recovery. Repeated recovery failures stop automatic restoration
+after three retry attempts. The final cleanup removes the failed virtual
+display without starting another setup.
+
+After mirroring, the app checks native **1:1 physical coordinates**, the
+actual fixed refresh rate, and VRR state. Pinning no longer substitutes a
+lower rate or resolution. Temporary HDR unavailability and invalid physical
+timing are also excluded from preference capture during shutdown. A manual HDR
+toggle that enables VRR at the correct resolution/rate is still observed before
+fixed-refresh repair, so the user's HDR choice is preserved.
+
+The focused test runner is **App/Tests/run-display-connection-tests.sh**.
+The readiness model covers 30 assertions, including capability flapping,
+temporary 4K/30 Hz modes, the absolute deadline, and incorrect physical
+scale/rate. A live negative test requested an unavailable 8K120 timing:
+the app retained the native desktop for the whole observation, timed out
+once without creating a virtual display or restarting, and preserved HDR
+preferences. A normal application restart restored 4384×2466 HiDPI, native
+1:1 8K60, and HDR10 RGB Full 12-bit on the QN990F. External HDR off/on changes
+were also remembered and restored the chosen HDR format without changing
+the mirror or native fixed timing. One real switch to another computer and
+back also passed: logs captured the disconnect, restoration to native 8K60,
+and HDR10 RGB Full 12-bit readback. The user confirmed normal cursor
+coordinates, text cursor, right-edge Dock, and HDR after switching back.
+This validates that cycle; it does not establish the cause of the earlier
+HDMI capability loss or guarantee every switch/cable combination.
 
 ## Keep external as main display
 
@@ -120,7 +166,7 @@ These modes still use virtual display mirroring. The virtual framebuffer
 is resampled to the panel's native output; only the 200% preset matches
 the physical pixel grid exactly.
 
-Local build 8.7 keeps the stable output policy: distinguish fixed-refresh
+Local build 8.8 keeps the stable output policy: distinguish fixed-refresh
 modes from VRR modes with the same maximum rate, then select a **one-to-one
 native physical mode after** establishing the mirror. The virtual source
 continues to supply the 2x HiDPI desktop. HDR/output changes are checked
@@ -209,7 +255,7 @@ cd /path/to/HiDPIVirtualDisplay/App
 - Since 1.2.3, sleep/wake and brief monitor dropouts keep the existing setup (and your window layout) instead of rebuilding it; if HiDPI ever fails to come back, re-apply the preset from the menu
 - Switching presets or disabling HiDPI briefly restarts the app (virtual displays can only be fully torn down when the process exits)
 - Refresh rate is auto-detected; if your monitor flickers, set it manually under Settings > Refresh Rate
-- Since 1.2.6, resolution wins over refresh rate. If your cable or port can't carry the panel's native resolution at the rate you picked, the app uses the fastest rate that *does* run at native instead of shrinking the desktop. Bandwidth-limited HDMI links hit this most often
+- Build 8.8 requires the selected fixed refresh rate at native resolution before restoring HiDPI. A temporary 8K30/4K fallback no longer replaces a previously working 8K60 timing. If the link cannot offer the requested mode, the app stays on the native desktop and shows a retry message.
 - Mirroring resamples unless the preset's framebuffer matches the panel exactly. On a 7680x2160 panel only the 3840x1080 (2.0x) preset is a 1:1 mirror; every other preset trades a little sharpness for smaller text
 
 ## Troubleshooting
