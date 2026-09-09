@@ -677,6 +677,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let kWasCrashKey = "wasRunningWhenCrashed"
     private let kAutoRestoreKey = "autoRestoreOnCrash"
     private let kAutoApplyOnConnectKey = "autoApplyOnConnect"
+    private let kRetainVirtualOnDisconnectKey = "retainVirtualDisplayOnDisconnect"
+    private var retainedReconnect: RetainedDisplayReconnect?
+    private var retainedReconnectWorkItem: DispatchWorkItem?
+    private var retainedReconnectStartedAt: TimeInterval?
     private let kVirtualRefreshPolicyKey = "experimentalVirtualRefreshMultiplier"
     private let kCompositionBudgetKey = "experimentalCompositionBudgetMS"
     private let kRefreshRateKey = "customRefreshRate"  // 0.0 = auto-detect
@@ -890,6 +894,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ) { [weak self] _ in
             debugLog(">>> Screens did sleep — deferring disconnect handling")
             self?.screensAsleep = true
+            self?.retainedReconnect?.resetProbe()
             self?.beginOutputRestore()
         }
 
@@ -901,6 +906,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             debugLog(">>> Screens did wake")
             self?.screensAsleep = false
             self?.beginOutputRestore()
+            _ = self?.handleRetainedDisplayConnection()
             self?.scheduleFixedRefreshCheck()
             // The panel takes a few seconds to re-enumerate; the display-change
             // notification then repairs the mirror if it broke. The periodic
@@ -943,6 +949,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fixedRefreshWorkItem = nil
         mirrorReattachWorkItem?.cancel()
         mirrorReattachWorkItem = nil
+        clearRetainedReconnect()
         displayCheckTimer?.invalidate()
         displayCheckTimer = nil
         debugLog("Display change monitoring stopped")
@@ -951,6 +958,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func periodicDisplayCheck() {
         // Don't trigger cleanup during setup or pending restart
         if isSettingUp || isRestarting { return }
+
+        if handleRetainedDisplayConnection() { return }
 
         // HDR may change the output timing without changing the display count.
         scheduleFixedRefreshCheck()
@@ -1014,6 +1023,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        if retainedReconnect != nil {
+            retainedReconnect?.resetProbe()
+            _ = handleRetainedDisplayConnection()
+            return
+        }
+
         // Check if we have a saved preset to restore
         guard let lastPreset = UserDefaults.standard.string(forKey: kLastPresetKey), !lastPreset.isEmpty else {
             debugLog("Wake: No saved preset to restore")
@@ -1066,6 +1081,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        isSettingUp = false
+        if handleRetainedDisplayConnection() { return }
+
         // Cases 1 and 2: the virtual display survived sleep. Keeping it alive
         // keeps every window exactly where it was.
         if ensureMirrorIntact() {
@@ -1075,7 +1093,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        if mirrorReattachWorkItem != nil || isRestarting {
+        if mirrorReattachWorkItem != nil || retainedReconnect != nil || isRestarting {
             isSettingUp = false
             return
         }
@@ -1102,6 +1120,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Returns false when there is nothing usable to re-attach.
     @discardableResult
     func ensureMirrorIntact() -> Bool {
+        if retainedReconnect != nil {
+            _ = handleRetainedDisplayConnection()
+            return false
+        }
         // findExternalDisplay (not findRealPhysicalMonitor) so that with
         // multiple externals we re-attach to the fingerprint-matched monitor,
         // not whichever one CoreGraphics lists first.
@@ -1214,7 +1236,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// mirror. Debounce notifications, touch only our active target, and stop
     /// after three failed repairs until a stable mode or a new setup is observed.
     func scheduleFixedRefreshCheck() {
-        guard isActive, !isSettingUp, !isRestarting, !screensAsleep else { return }
+        guard isActive, !isSettingUp, !isRestarting, !screensAsleep,
+              retainedReconnect == nil else { return }
         fixedRefreshWorkItem?.cancel()
         let generation = setupGeneration
         let work = DispatchWorkItem { [weak self] in
@@ -1223,7 +1246,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let target = self.targetExternalDisplayID
             guard generation == self.setupGeneration,
                   self.isActive, !self.isSettingUp, !self.isRestarting, !self.screensAsleep,
-                  target != 0, self.currentVirtualID != 0,
+                  self.retainedReconnect == nil, target != 0, self.currentVirtualID != 0,
                   self.displayIsOnline(target), self.displayIsOnline(self.currentVirtualID),
                   CGDisplayMirrorsDisplay(target) == self.currentVirtualID else { return }
 
@@ -1271,6 +1294,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             debugLog("Setup/restart in progress, skipping disconnect check")
             return
         }
+
+        if handleRetainedDisplayConnection() { return }
 
         // Case 1: HiDPI is active, check if physical monitor was disconnected
         if isActive && currentVirtualID != 0 {
@@ -1402,6 +1427,169 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
+    private func clearRetainedReconnect() {
+        retainedReconnectWorkItem?.cancel()
+        retainedReconnectWorkItem = nil
+        retainedReconnect = nil
+        retainedReconnectStartedAt = nil
+    }
+
+    private func ownedDesktopSignature() -> RetainedDesktopSignature? {
+        guard isActive, currentVirtualID != 0,
+              VirtualDisplayManager.shared().currentDisplayID == currentVirtualID,
+              displayIsOnline(currentVirtualID), let mode = CGDisplayCopyDisplayMode(currentVirtualID) else { return nil }
+        return RetainedDesktopSignature(displayID: currentVirtualID,
+            width: mode.width, height: mode.height, pixelWidth: mode.pixelWidth,
+            pixelHeight: mode.pixelHeight, refreshRate: mode.refreshRate)
+    }
+
+    private func boundPhysicalDisplay() -> CGDirectDisplayID? {
+        var displays = [CGDirectDisplayID](repeating: 0, count: 32)
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(32, &displays, &count)
+        return displays.prefix(Int(count)).first {
+            CGDisplayIsBuiltin($0) == 0 && CGDisplayVendorNumber($0) != 0x1234 &&
+            CGDisplayVendorNumber($0) != 0x756E6B6E && displayMatchesSavedFingerprint($0)
+        }
+    }
+
+    private func anotherPhysicalScreenIsActive() -> Bool {
+        var displays = [CGDirectDisplayID](repeating: 0, count: 32)
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(32, &displays, &count)
+        return displays.prefix(Int(count)).contains {
+            CGDisplayVendorNumber($0) != 0x1234 && CGDisplayVendorNumber($0) != 0x756E6B6E
+        }
+    }
+
+    /// Own the reconnect lifecycle only while retaining our live virtual object.
+    /// Ordinary disconnection still uses the existing cleanup when disabled or
+    /// when a laptop/other real screen is in use.
+    @discardableResult
+    private func handleRetainedDisplayConnection() -> Bool {
+        guard !isSettingUp, !isRestarting, !screensAsleep else { return retainedReconnect != nil }
+        let target = boundPhysicalDisplay()
+        if retainedReconnect != nil {
+            guard UserDefaults.standard.bool(forKey: kRetainVirtualOnDisconnectKey),
+                  UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey) else {
+                clearRetainedReconnect()
+                wasDisconnected = true
+                cleanupAfterDisconnect()
+                return true
+            }
+            if target == nil && anotherPhysicalScreenIsActive() {
+                debugLog("Retained desktop: another physical screen is active; returning to normal cleanup")
+                clearRetainedReconnect()
+                wasDisconnected = true
+                cleanupAfterDisconnect()
+                return true
+            }
+            guard ownedDesktopSignature() != nil else {
+                clearRetainedReconnect()
+                suspendMirrorForConnection("Retained virtual display no longer exists")
+                return true
+            }
+            if target != nil, retainedReconnectWorkItem == nil { checkRetainedMirror() }
+            return true
+        }
+        guard UserDefaults.standard.bool(forKey: kRetainVirtualOnDisconnectKey),
+              UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey),
+              let desktop = ownedDesktopSignature(),
+              let requirement = setupTimingRequirement,
+              abs(desktop.refreshRate - sourceRefreshRate(for: requirement)) <= 0.5,
+              target == nil || CGDisplayMirrorsDisplay(target!) != currentVirtualID else { return false }
+        if target == nil && anotherPhysicalScreenIsActive() { return false }
+
+        setupGeneration += 1
+        disconnectConfirmationPending = false
+        mirrorReattachWorkItem?.cancel()
+        mirrorReattachWorkItem = nil
+        fixedRefreshWorkItem?.cancel()
+        fixedRefreshWorkItem = nil
+        retainedReconnect = RetainedDisplayReconnect(desktop: desktop, requirement: requirement)
+        wasDisconnected = true
+        UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
+        beginOutputRestore()
+        connectionRecoveryMessage = "Virtual desktop retained; waiting for this monitor."
+        debugLog("Retained desktop: keeping virtual \(currentVirtualID) alive for HDMI switching (PID \(ProcessInfo.processInfo.processIdentifier))")
+        rebuildMenu()
+        if target != nil { checkRetainedMirror() }
+        return true
+    }
+
+    private func checkRetainedMirror() {
+        guard var recovery = retainedReconnect, !isRestarting, !isSettingUp, !screensAsleep else { return }
+        let target = boundPhysicalDisplay()
+        let now = ProcessInfo.processInfo.systemUptime
+        let capabilities = target.flatMap { linkCapabilities(for: $0) }
+        if target != nil && retainedReconnectStartedAt == nil {
+            retainedReconnectStartedAt = now
+            debugLog("Retained desktop: monitor returned; validating native timing")
+        }
+        // macOS can automatically restore a mirror with stale scaled coordinates.
+        // Detach only that invalid target while waiting, keeping the virtual
+        // object alive so the old clipped/mis-mapped cursor cannot persist.
+        if let target = target, CGDisplayMirrorsDisplay(target) == currentVirtualID,
+           !physicalTimingMatches(target, requirement: recovery.requirement, requiresFixedRefresh: false) {
+            guard VirtualDisplayManager.shared().stopMirroring(forDisplay: target) else {
+                clearRetainedReconnect()
+                suspendMirrorForConnection("Could not detach stale retained mirror coordinates")
+                return
+            }
+            debugLog("Retained desktop: detached stale target coordinates while waiting for native timing")
+        }
+        let decision = recovery.observe(desktop: ownedDesktopSignature(), capabilities: capabilities,
+                                        physicalPresent: target != nil, at: now)
+        retainedReconnect = recovery
+        switch decision {
+        case .disconnected:
+            retainedReconnectStartedAt = nil
+            // Wait for topology/wake notifications; the 30s timer is a backstop.
+            return
+        case .rebuild:
+            clearRetainedReconnect()
+            suspendMirrorForConnection("Retained desktop or returning link failed validation")
+            return
+        case .waiting:
+            break
+        case .ready:
+            guard let target = target else { return }
+            let manager = VirtualDisplayManager.shared()
+            targetExternalDisplayID = target
+            prepareOutputPreference(for: target)
+            let alreadyMirrored = CGDisplayMirrorsDisplay(target) == currentVirtualID
+            let ok = alreadyMirrored
+                ? manager.pinNativeMode(forDisplay: target, atRate: recovery.requirement.refreshRate)
+                : manager.mirrorDisplay(currentVirtualID, toDisplay: target, atRate: recovery.requirement.refreshRate)
+            guard ok, CGDisplayMirrorsDisplay(target) == currentVirtualID,
+                  recovery.desktop.matches(ownedDesktopSignature()),
+                  physicalTimingMatches(target, requirement: recovery.requirement) else {
+                clearRetainedReconnect()
+                suspendMirrorForConnection("Retained mirror failed native/cursor geometry verification")
+                return
+            }
+            let elapsed = ProcessInfo.processInfo.systemUptime - (retainedReconnectStartedAt ?? now)
+            debugLog(String(format: "Retained desktop: restored virtual %u without recreating it (reconnect %.2fs, alreadyMirrored=%d)", currentVirtualID, elapsed, alreadyMirrored ? 1 : 0))
+            clearRetainedReconnect()
+            wasDisconnected = false
+            UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+            connectionRecoveryMessage = nil
+            connectionRecoveryBlocked = false
+            rememberStableTiming(recovery.requirement, for: target)
+            reassertPreferencesAfterSetup()
+            rebuildMenu()
+            return
+        }
+        let generation = setupGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, generation == self.setupGeneration else { return }
+            self.retainedReconnectWorkItem = nil
+            self.checkRetainedMirror()
+        }
+        retainedReconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+    }
+
     /// The monitor can vanish from the display list for a few seconds without
     /// being unplugged — DisplayPort link retraining on wake, the panel
     /// power-cycling, or EDID re-reads (it shows up as a ghost "unkn" display
@@ -1422,8 +1610,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func confirmDisconnect(attempt: Int) {
+        let generation = setupGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, generation == self.setupGeneration,
+                  self.retainedReconnect == nil else { return }
             if self.isSettingUp || self.isRestarting || self.screensAsleep {
                 self.disconnectConfirmationPending = false
                 return
@@ -1549,6 +1739,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isSettingUp = false   // A cancelled setup step won't clear this itself
         mirrorReattachWorkItem?.cancel()
         mirrorReattachWorkItem = nil
+        clearRetainedReconnect()
 
         let manager = VirtualDisplayManager.shared()
 
@@ -1923,6 +2114,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         autoApplyItem.state = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey) ? .on : .off
         settingsMenu.addItem(autoApplyItem)
 
+        let retainItem = NSMenuItem(title: "Keep Virtual Display During HDMI Switch", action: #selector(toggleRetainedDisplay(_:)), keyEquivalent: "")
+        retainItem.target = self
+        retainItem.state = UserDefaults.standard.bool(forKey: kRetainVirtualOnDisconnectKey) ? .on : .off
+        retainItem.toolTip = "Keep the desktop ready while the TV is away. Requires Auto-Apply; releases it when another real screen is in use."
+        settingsMenu.addItem(retainItem)
+
         let autoRestoreItem = NSMenuItem(title: "Auto-Restore After Crash", action: #selector(toggleAutoRestore(_:)), keyEquivalent: "")
         autoRestoreItem.target = self
         autoRestoreItem.state = UserDefaults.standard.bool(forKey: kAutoRestoreKey) ? .on : .off
@@ -2070,6 +2267,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let current = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey)
         UserDefaults.standard.set(!current, forKey: kAutoApplyOnConnectKey)
         debugLog("Auto-apply on reconnect: \(!current)")
+        if current, retainedReconnect != nil {
+            clearRetainedReconnect()
+            wasDisconnected = true
+            cleanupAfterDisconnect()
+            return
+        }
+        rebuildMenu()
+    }
+
+    @objc func toggleRetainedDisplay(_ sender: NSMenuItem) {
+        let enabled = !UserDefaults.standard.bool(forKey: kRetainVirtualOnDisconnectKey)
+        UserDefaults.standard.set(enabled, forKey: kRetainVirtualOnDisconnectKey)
+        if !enabled, retainedReconnect != nil {
+            clearRetainedReconnect()
+            wasDisconnected = true
+            cleanupAfterDisconnect()
+            return
+        }
         rebuildMenu()
     }
 
@@ -2124,6 +2339,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func handleOutputTopologyChange(_ display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
+        if flags.contains(.removeFlag) || flags.contains(.addFlag) {
+            if handleRetainedDisplayConnection() { return }
+        }
         guard isActive, display == targetExternalDisplayID else { return }
         if flags.contains(.removeFlag) || flags.contains(.addFlag) {
             // Topology changes are not a manual HDR-off choice. Preserve the
@@ -2136,7 +2354,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func stableOutputTarget() -> CGDirectDisplayID? {
         let target = targetExternalDisplayID
         guard isActive, !isSettingUp, !isRestarting, !screensAsleep,
-              !disconnectConfirmationPending, displayIsOnline(target),
+              !disconnectConfirmationPending, retainedReconnect == nil, displayIsOnline(target),
               displayIsOnline(currentVirtualID),
               CGDisplayMirrorsDisplay(target) == currentVirtualID else { return nil }
         return target
@@ -2169,6 +2387,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func captureHDRBeforeTeardown() {
         let target = targetExternalDisplayID
         guard !outputRestore.pending, !screensAsleep, !disconnectConfirmationPending,
+              retainedReconnect == nil,
               Date().timeIntervalSinceReferenceDate >= outputObservationAfter,
               isActive, displayIsOnline(target), displayIsOnline(currentVirtualID),
               CGDisplayMirrorsDisplay(target) == currentVirtualID,
@@ -2652,6 +2871,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isSettingUp = false   // A cancelled setup step won't clear this itself
         mirrorReattachWorkItem?.cancel()
         mirrorReattachWorkItem = nil
+        clearRetainedReconnect()
 
         let manager = VirtualDisplayManager.shared()
 

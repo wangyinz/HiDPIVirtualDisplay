@@ -2,7 +2,7 @@
 
 This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
 right-edge Dock repair, persistent physical HDR/color output, and guarded HDMI
-reconnection. Current local experimental build: **8.14** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
+reconnection. Current local experimental build: **8.15** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
 below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -55,6 +55,35 @@ Click the display icon in your menu bar, pick your monitor, pick a resolution pr
 ### Custom scale
 
 Every monitor submenu has a **Custom Scale...** option — it opens a slider for any factor between 1.1x and 2.0x. The resolution preview updates as you drag.
+
+### Faster HDMI switching (build 8.15)
+
+**Settings → Keep Virtual Display During HDMI Switch** is opt-in and requires
+Auto-Apply on Reconnect. When the bound monitor disappears and no other real
+screen is active, the helper retains its own virtual display and process.
+The returning monitor must match the saved identity and pass the existing
+native timing gate (three observations over at least two seconds).
+
+If macOS kept the mirror, the helper verifies/pins its native fixed timing.
+Otherwise it reattaches the same virtual source. It checks the source ID,
+logical/backing dimensions and refresh rate, plus physical native 1:1 geometry
+and fixed refresh, before resuming HDR/color and Dock restoration. Stale
+scaled target coordinates are detached while waiting. A missing or changed
+source, an unready link after 30 seconds, or a failed mirror falls back to the
+bounded full-recovery path.
+
+Time spent on the other computer does not consume the returning-link timeout;
+there is no active capability polling while the monitor is absent. If the
+laptop screen or another physical screen becomes active, the helper releases
+the retained desktop through normal cleanup. Disabling this option or
+Auto-Apply also returns to normal cleanup. Display/preset changes and quit
+cancel pending retained recovery.
+
+This avoids the previous 12-second disconnect teardown, process relaunch and
+virtual-screen creation on normal switch cycles. HDMI link negotiation and
+required display-mode changes may still blank the TV. Real switch timing is
+being validated; 26 retention tests, 30 existing readiness assertions, HDR
+preference tests and the universal build/signature pass.
 
 ### Experimental virtual refresh (build 8.14)
 
