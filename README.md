@@ -2,7 +2,7 @@
 
 This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
 right-edge Dock repair, persistent physical HDR/color output, and guarded HDMI
-reconnection. Current local build: **8.8**, based on upstream 1.2.6. Build this fork from source
+reconnection. Current local experimental build: **8.14** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
 below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -55,6 +55,66 @@ Click the display icon in your menu bar, pick your monitor, pick a resolution pr
 ### Custom scale
 
 Every monitor submenu has a **Custom Scale...** option — it opens a slider for any factor between 1.1x and 2.0x. The resolution preview updates as you drag.
+
+### Experimental virtual refresh (build 8.14)
+
+**Settings → Virtual Refresh (Experimental)** controls virtual render cadence
+independently of the physical output. The default is **Match physical output**.
+With a physical 60 Hz output, the other options create virtual **75, 90, 94,
+98, 101, 105, 113, or 120 Hz** desktops. Increased rates are rounded to whole Hz
+before creation and health checks; requests above 240 Hz fall back to the
+physical rate. Matched cadence preserves the physical rate without rounding.
+
+On an M4 Pro / Samsung QN990F at 150%, the user found 120 Hz clearly more
+responsive than 60 Hz, but saw frequent pink blocks at window edges. At 105 Hz,
+latency improved over 90 Hz but small blocks flashed every 3–4 seconds.
+90 Hz initially appeared clean, including after a real HDMI switch away/back;
+longer use revealed rare blocks while dragging windows too. **These are
+experimental tradeoffs, not a corruption-free latency fix.** No end-to-end
+millisecond improvement has been measured.
+
+The user chose to stop testing and retain **virtual 90 Hz**, with **Automatic
+Composition Budget**, **150%**, and **physical native 8K fixed 60 Hz / HDR10
+RGB Full 12 bpc**. The menu retains the other rates for manual comparison.
+Physical timing, HDR/color, normal cursor scaling and Dock repair are preserved.
+For flashing blocks, select a lower virtual rate or Match physical output.
+Noninteger ratios to the physical rate can also make animation cadence uneven.
+
+The stable-link gate and HDR restoration still use the physical rate;
+creation, health checks and reattachment verify the virtual rate separately.
+Changing a choice cleanly restarts the helper with the same preset and output
+preferences. A 120 Hz virtual desktop does not request 8K120 from the TV.
+
+Validation: 175 policy checks, universal arm64/x86_64 build and strict signature
+verification. The real 90 Hz HDMI-switch test restored 90/60 Hz, HDR, cursor
+and Dock correctly; it did not establish long-term absence of artifacts.
+The 4 ms / 60 Hz budget trial had no noticeable latency benefit. A 4 ms /
+120 Hz trial still produced the same severe pink artifacts, according to
+the user; the shorter budget did not eliminate corruption. No HDR-off or lower-bit-depth trial
+was performed.
+
+### Experimental composition budget (local build 8.9)
+
+**Settings → Composition Budget (Experimental)** offers **Automatic**, **8 ms**,
+and **4 ms**. Automatic is the default and keeps the existing display path.
+The other choices set the optional virtual-display `refreshDeadline` before
+creating the virtual screen. Changing the choice restarts the helper and
+restores the same preset, physical timing, and HDR/color preference.
+
+On macOS 26.6.2, inspection of the installed SkyLight framework traces this
+value to `SLCADisplay::composition_deadline()` and then to the compositor's
+work-interval scheduling deadline. The value is in seconds; zero skips the
+override. This is a scheduling experiment, **not a measured input-latency
+value or a guaranteed latency reduction**. A shorter budget can increase
+power use. Use Automatic to return to the previous scheduling behavior.
+
+The implementation accepts only the two experimental budgets, limits the
+value to one refresh period, checks runtime selector availability and
+settings readback, and falls back to fresh default settings if the optional
+API fails. This does not change mirror geometry, physical refresh policy,
+or cursor scaling. 23 checks cover conversion, bounds, invalid input,
+missing/throwing APIs, rejected readback, and an unattached real settings
+object; no display is created by those tests.
 
 ### HDR and physical color output (local build 8.7)
 

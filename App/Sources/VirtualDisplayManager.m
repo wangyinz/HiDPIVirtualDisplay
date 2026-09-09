@@ -31,6 +31,7 @@ static id _windowObserver = nil;
     NSString *_displayName;
     CGDirectDisplayID _currentDisplayID;
     BOOL _dockRepairInFlight;
+    double _appliedCompositionBudgetMilliseconds;
 }
 @end
 
@@ -42,6 +43,32 @@ static CGFloat cfDictGetFixed16(CFDictionaryRef dict, CFStringRef key) {
     int32_t raw = 0;
     CFNumberGetValue(ref, kCFNumberSInt32Type, &raw);
     return (CGFloat)raw / 65536.0;
+}
+
+BOOL VDMApplyVirtualCompositionBudget(id settings, double milliseconds,
+                                      double refreshRate, double *appliedSeconds) {
+    if (appliedSeconds) *appliedSeconds = 0;
+    // Automatic never calls the private setter, preserving existing behavior.
+    if (milliseconds == 0) return YES;
+    if ((milliseconds != 4 && milliseconds != 8) ||
+        !isfinite(refreshRate) || refreshRate <= 0 ||
+        ![settings respondsToSelector:@selector(setRefreshDeadline:)] ||
+        ![settings respondsToSelector:@selector(refreshDeadline)]) return NO;
+    double deadline = fmin(milliseconds / 1000.0, 1.0 / refreshRate);
+    @try {
+        [(CGVirtualDisplaySettings *)settings setRefreshDeadline:deadline];
+        double actual = [(CGVirtualDisplaySettings *)settings refreshDeadline];
+        if (!isfinite(actual) || fabs(actual - deadline) > 0.000001) {
+            [(CGVirtualDisplaySettings *)settings setRefreshDeadline:0];
+            return NO;
+        }
+        if (appliedSeconds) *appliedSeconds = actual;
+        return YES;
+    } @catch (NSException *exception) {
+        @try { [(CGVirtualDisplaySettings *)settings setRefreshDeadline:0]; }
+        @catch (NSException *ignored) { }
+        return NO;
+    }
 }
 
 @implementation VirtualDisplayManager
@@ -136,6 +163,16 @@ static void retainWindowIfNeeded(NSWindow *window) {
     return self;
 }
 
+- (BOOL)supportsCompositionBudget {
+    Class settings = NSClassFromString(@"CGVirtualDisplaySettings");
+    return [settings instancesRespondToSelector:@selector(setRefreshDeadline:)] &&
+           [settings instancesRespondToSelector:@selector(refreshDeadline)];
+}
+
+- (double)appliedCompositionBudgetMilliseconds {
+    return _appliedCompositionBudgetMilliseconds;
+}
+
 - (CGDirectDisplayID)currentDisplayID {
     return _currentDisplayID;
 }
@@ -171,6 +208,19 @@ static void retainWindowIfNeeded(NSWindow *window) {
         // "destroy" (the phantom-display source).
         CGVirtualDisplaySettings *settings = [[CGVirtualDisplaySettings alloc] init];
         settings.hiDPI = hiDPI ? 1 : 0;
+        double appliedDeadline = 0;
+        BOOL budgetApplied = VDMApplyVirtualCompositionBudget(
+            settings, self.compositionBudgetMilliseconds, refreshRate, &appliedDeadline);
+        _appliedCompositionBudgetMilliseconds = appliedDeadline * 1000;
+        if (!budgetApplied) {
+            // Discard the settings object if a private setter failed; a fresh
+            // default object keeps the known-good creation path available.
+            [settings release];
+            settings = [[CGVirtualDisplaySettings alloc] init];
+            settings.hiDPI = hiDPI ? 1 : 0;
+        }
+        NSLog(@"VDM: Composition budget requested %.3f ms, settings readback %.3f ms, accepted=%d",
+              self.compositionBudgetMilliseconds, _appliedCompositionBudgetMilliseconds, budgetApplied);
         _settings = settings;
 
         CGVirtualDisplayDescriptor *descriptor = [[CGVirtualDisplayDescriptor alloc] init];
@@ -227,8 +277,9 @@ static void retainWindowIfNeeded(NSWindow *window) {
         // pick the fallback over the requested rate after some mirror configs,
         // making the virtual render at 60 Hz even when the user asked for 120
         // (the panel scanned at 120 but content only updated 60 times/sec).
-        // The caller waits for a stable native physical timing before creating
-        // the virtual source, and uses that same rate through mirror setup.
+        // The caller waits for stable native physical timing before creating
+        // this source. An experimental faster source cadence is independent
+        // of the captured physical rate passed to mirrorDisplay:toDisplay:atRate:.
         NSMutableArray *modes = [NSMutableArray arrayWithObject:_mode];
         _modesArray = [modes retain];
         _settings.modes = _modesArray;

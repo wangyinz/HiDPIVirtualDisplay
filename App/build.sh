@@ -12,7 +12,7 @@ MACOS="${CONTENTS}/MacOS"
 RESOURCES="${CONTENTS}/Resources"
 
 # Source files
-SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift Sources/DisplayOutputPreferences.swift Sources/DisplayConnectionReadiness.swift"
+SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift Sources/DisplayOutputPreferences.swift Sources/DisplayConnectionReadiness.swift Sources/VirtualRefreshPolicy.swift"
 OBJC_SOURCES="Sources/VirtualDisplayManager.m"
 BRIDGING_HEADER="Sources/BridgingHeader.h"
 

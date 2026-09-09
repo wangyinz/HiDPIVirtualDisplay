@@ -21,6 +21,12 @@ NSInteger VDMVariableRefreshState(CGDirectDisplayID displayID);
 /// Used to wait out incomplete HDMI capability negotiation before mirroring.
 NSDictionary<NSString *, id> * _Nullable VDMNativeTimingCapabilities(CGDirectDisplayID displayID);
 
+/// Apply an opt-in compositor scheduling budget (0 = leave OS default).
+/// Accepts only 4 or 8 ms; clamps to one refresh period. No display is created.
+/// A false result means the optional API is unavailable or rejected the value.
+BOOL VDMApplyVirtualCompositionBudget(id settings, double milliseconds,
+                                      double refreshRate, double * _Nullable appliedSeconds);
+
 @interface VirtualDisplayManager : NSObject
 
 /// Shared instance
@@ -28,6 +34,12 @@ NSDictionary<NSString *, id> * _Nullable VDMNativeTimingCapabilities(CGDirectDis
 
 /// Currently active virtual display ID (or kCGNullDirectDisplay if none)
 @property (nonatomic, readonly) CGDirectDisplayID currentDisplayID;
+
+/// Experimental compositor budget for subsequent virtual display creation.
+/// Default 0 preserves the OS behavior. This is not an input-latency guarantee.
+@property (nonatomic) double compositionBudgetMilliseconds;
+@property (nonatomic, readonly) double appliedCompositionBudgetMilliseconds;
+- (BOOL)supportsCompositionBudget;
 
 /// Create a virtual display with specified parameters
 /// @param width Width in pixels

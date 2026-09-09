@@ -26,6 +26,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface CGVirtualDisplaySettings : NSObject
 
+// Optional on older macOS; always check both selectors before use.
+@property (nonatomic) double refreshDeadline;
 @property (nonatomic) unsigned int hiDPI;
 @property (nonatomic, retain) NSArray<CGVirtualDisplayMode *> *modes;
 

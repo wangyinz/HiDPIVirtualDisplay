@@ -677,6 +677,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let kWasCrashKey = "wasRunningWhenCrashed"
     private let kAutoRestoreKey = "autoRestoreOnCrash"
     private let kAutoApplyOnConnectKey = "autoApplyOnConnect"
+    private let kVirtualRefreshPolicyKey = "experimentalVirtualRefreshMultiplier"
+    private let kCompositionBudgetKey = "experimentalCompositionBudgetMS"
     private let kRefreshRateKey = "customRefreshRate"  // 0.0 = auto-detect
     private let kKeepHDREnabledKey = "keepHDREnabledBeta"  // Migration from 8.6 and earlier
     private let kOutputPreferencesKey = "displayOutputPreferencesV1"
@@ -1122,7 +1124,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let capabilities = linkCapabilities(for: physical),
               requirement.accepts(capabilities),
               let sourceMode = CGDisplayCopyDisplayMode(currentVirtualID),
-              abs(sourceMode.refreshRate - requirement.refreshRate) <= 0.5 else {
+              abs(sourceMode.refreshRate - sourceRefreshRate(for: requirement)) <= 0.5 else {
             suspendMirrorForConnection("Connection timing changed during reconnect")
             return false
         }
@@ -1232,7 +1234,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   let capabilities = self.linkCapabilities(for: target),
                   requirement.accepts(capabilities),
                   let source = CGDisplayCopyDisplayMode(self.currentVirtualID),
-                  abs(source.refreshRate - requirement.refreshRate) <= 0.5 else {
+                  abs(source.refreshRate - self.sourceRefreshRate(for: requirement)) <= 0.5 else {
                 self.suspendMirrorForConnection("Native mode or source refresh no longer matches")
                 return
             }
@@ -1963,6 +1965,65 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshItem.submenu = refreshMenu
         settingsMenu.addItem(refreshItem)
 
+        let virtualRateMenu = NSMenu()
+        let virtualPolicy = VirtualRefreshPolicy.preference(UserDefaults.standard.double(forKey: kVirtualRefreshPolicyKey))
+        for (title, choice) in [
+            ("Match physical output", VirtualRefreshPolicy.matched),
+            ("1.25× physical rate (75 Hz at 60 Hz)", .increased),
+            ("1.5× physical rate (90 Hz at 60 Hz)", .intermediate),
+            ("1.5625× physical rate (94 Hz at 60 Hz)", .fineLow),
+            ("1.625× physical rate (98 Hz at 60 Hz)", .fineMiddle),
+            ("1.6875× physical rate (101 Hz at 60 Hz)", .fineHigh),
+            ("1.75× physical rate (105 Hz at 60 Hz)", .higher),
+            ("1.875× physical rate (113 Hz at 60 Hz)", .nearDouble),
+            ("2× physical rate (120 Hz at 60 Hz)", .doubled)
+        ] {
+            let item = NSMenuItem(title: title, action: #selector(setVirtualRefreshPolicy(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = choice.rawValue as NSNumber
+            item.state = virtualPolicy == choice ? .on : .off
+            virtualRateMenu.addItem(item)
+        }
+        virtualRateMenu.addItem(.separator())
+        if isActive, let mode = CGDisplayCopyDisplayMode(currentVirtualID) {
+            let note = NSMenuItem(title: String(format: "Virtual desktop: %.1f Hz", mode.refreshRate), action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            virtualRateMenu.addItem(note)
+        }
+        let virtualRateNote = NSMenuItem(title: "Flashing blocks: choose a lower virtual rate", action: nil, keyEquivalent: "")
+        virtualRateNote.isEnabled = false
+        virtualRateMenu.addItem(virtualRateNote)
+        let virtualRateItem = NSMenuItem(title: "Virtual Refresh (Experimental)", action: nil, keyEquivalent: "")
+        virtualRateItem.submenu = virtualRateMenu
+        settingsMenu.addItem(virtualRateItem)
+
+        let budgetMenu = NSMenu()
+        let budget = UserDefaults.standard.double(forKey: kCompositionBudgetKey)
+        let supported = VirtualDisplayManager.shared().supportsCompositionBudget()
+        for (title, value) in [("Automatic (macOS)", 0.0), ("8 ms budget", 8.0), ("4 ms budget", 4.0)] {
+            let item = NSMenuItem(title: title, action: #selector(setCompositionBudget(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = value as NSNumber
+            item.state = budget == value ? .on : .off
+            item.isEnabled = value == 0 || supported
+            budgetMenu.addItem(item)
+        }
+        budgetMenu.autoenablesItems = false
+        budgetMenu.addItem(.separator())
+        let budgetNote = NSMenuItem(title: "Experimental; may increase power use", action: nil, keyEquivalent: "")
+        budgetNote.isEnabled = false
+        budgetMenu.addItem(budgetNote)
+        if isActive {
+            let applied = VirtualDisplayManager.shared().appliedCompositionBudgetMilliseconds
+            let text = applied > 0 ? String(format: "Applied to virtual settings: %.1f ms", applied) : "Applied to virtual settings: Automatic"
+            let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            budgetMenu.addItem(item)
+        }
+        let budgetItem = NSMenuItem(title: "Composition Budget (Experimental)", action: nil, keyEquivalent: "")
+        budgetItem.submenu = budgetMenu
+        settingsMenu.addItem(budgetItem)
+
         let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         settingsItem.submenu = settingsMenu
         menu.addItem(settingsItem)
@@ -2377,6 +2438,48 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = setMainDisplay(anchor)
     }
 
+    private func sourceRefreshRate(for requirement: DisplayTimingRequirement) -> Double {
+        VirtualRefreshPolicy.preference(UserDefaults.standard.double(forKey: kVirtualRefreshPolicyKey))
+            .sourceRate(for: requirement.refreshRate)
+    }
+
+    @objc private func setVirtualRefreshPolicy(_ sender: NSMenuItem) {
+        guard !isSettingUp, !isRestarting,
+              let number = sender.representedObject as? NSNumber,
+              let choice = VirtualRefreshPolicy(rawValue: number.doubleValue) else { return }
+        let old = VirtualRefreshPolicy.preference(UserDefaults.standard.double(forKey: kVirtualRefreshPolicyKey))
+        guard choice != old else { return }
+        captureHDRBeforeTeardown()
+        UserDefaults.standard.set(choice.rawValue, forKey: kVirtualRefreshPolicyKey)
+        debugLog("Experimental virtual refresh multiplier: \(choice.rawValue)")
+        if isActive || hasOrphanedVirtualDisplay() {
+            isRestarting = true
+            StatusWindowController.shared.show(message: "Applying virtual refresh rate...")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in relaunchApp() }
+        } else {
+            rebuildMenu()
+        }
+    }
+
+    @objc private func setCompositionBudget(_ sender: NSMenuItem) {
+        guard !isSettingUp, !isRestarting,
+              let number = sender.representedObject as? NSNumber else { return }
+        let value = number.doubleValue
+        guard [0.0, 4.0, 8.0].contains(value),
+              value == 0 || VirtualDisplayManager.shared().supportsCompositionBudget(),
+              UserDefaults.standard.double(forKey: kCompositionBudgetKey) != value else { return }
+        captureHDRBeforeTeardown()
+        UserDefaults.standard.set(value, forKey: kCompositionBudgetKey)
+        debugLog("Experimental composition budget: \(value) ms; applying with a clean virtual display")
+        if isActive || hasOrphanedVirtualDisplay() {
+            isRestarting = true
+            StatusWindowController.shared.show(message: "Applying composition budget...")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in relaunchApp() }
+        } else {
+            rebuildMenu()
+        }
+    }
+
     @objc func setRefreshRate(_ sender: NSMenuItem) {
         guard let rate = sender.representedObject as? NSNumber else { return }
         let oldRate = UserDefaults.standard.double(forKey: kRefreshRateKey)
@@ -2724,13 +2827,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         beginOutputRestore()
         logPanelModeSummary(externalID)
         StatusWindowController.shared.updateStatus("Creating virtual display…")
-        let refreshRate = requirement.refreshRate
-        debugLog("Will create virtual display at \(refreshRate) Hz; timing fixed for this setup generation")
+        let refreshRate = sourceRefreshRate(for: requirement)
+        debugLog("Virtual source \(refreshRate) Hz; physical output \(requirement.refreshRate) Hz")
 
         // Create virtual display with color primaries matching the physical display.
         // This lets ColorSync use an identity transform instead of doing expensive
         // per-frame color conversion that was causing WindowServer deadlocks.
         let manager = VirtualDisplayManager.shared()
+        let savedBudget = UserDefaults.standard.double(forKey: kCompositionBudgetKey)
+        manager.compositionBudgetMilliseconds = [0.0, 4.0, 8.0].contains(savedBudget) ? savedBudget : 0
         debugLog("Calling createVirtualDisplay (matching display \(externalID))...")
         let virtualID = manager.createVirtualDisplay(
             withWidth: config.width,
@@ -2774,14 +2879,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         debugLog("Setting up mirror: \(virtualID) -> \(externalID)")
         let manager = VirtualDisplayManager.shared()
-        // Pin the physical target to the same rate the virtual was created at,
-        // so the panel scans out at the requested rate instead of being left in
-        // VRR mode (which can downgrade effective rate and break the cursor).
+        // The physical requirement stays fixed even if the experimental source
+        // cadence is increased. Never request the virtual rate from the TV.
         guard let requirement = setupTimingRequirement,
               displayIsOnline(virtualID), displayIsOnline(externalID),
               let capabilities = linkCapabilities(for: externalID), requirement.accepts(capabilities),
               let source = CGDisplayCopyDisplayMode(virtualID),
-              abs(source.refreshRate - requirement.refreshRate) <= 0.5 else {
+              abs(source.refreshRate - self.sourceRefreshRate(for: requirement)) <= 0.5 else {
             suspendMirrorForConnection("Connection changed between create and mirror")
             return
         }
