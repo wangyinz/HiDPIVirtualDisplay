@@ -2,7 +2,7 @@
 
 This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
 right-edge Dock repair, persistent physical HDR/color output, and guarded HDMI
-reconnection. Current local experimental build: **8.17** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
+reconnection. Current local experimental build: **8.18** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
 below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -50,11 +50,42 @@ cp -r "build/G9 Helper.app" /Applications/
 
 ## Usage
 
-Click the display icon in your menu bar, pick your monitor, pick a resolution preset. Takes a few seconds to apply. To turn it off, select **Disable HiDPI** from the same menu.
+Click the display icon in your menu bar, pick your monitor, pick a resolution preset. Takes a few seconds to apply. To turn it off, select **Disable Virtual Display** from the same menu.
 
 ### Custom scale
 
 Every monitor submenu has a **Custom Scale...** option — it opens a slider for any factor between 1.1x and 2.0x. The resolution preview updates as you drag.
+
+### Virtual rendering density (build 8.18)
+
+**Virtual Display Rendering → Standard (1×, non-HiDPI)** keeps the virtual
+mirror and the selected desktop size while rendering one pixel per logical
+point. At 4800×2700, the source framebuffer becomes 4800×2700 instead of
+9600×5400. The physical output stays at its configured native timing, so an
+8K panel enlarges this image and text may look softer. Fewer source pixels
+may reduce composition cost; latency and artifact improvements need testing.
+
+Select **HiDPI (2×)** in the same submenu to restore the higher rendering
+density. Both choices preserve the logical preset, virtual refresh rate,
+physical refresh rate, HDR and color preferences. Density is saved separately
+and applied to standard/custom presets and reconnect recovery. Changing it
+briefly restarts the helper to recreate the source. **Disable Virtual Display**
+(the former **Disable HiDPI**) still removes the virtual screen entirely.
+
+The helper explicitly selects the requested source mode if macOS restores an
+old resolution, and verifies both logical and backing dimensions before and
+after mirroring. If a 1× source cannot match the request, it returns to 2×
+instead of leaving a 1080p desktop enlarged across the panel.
+
+On the local M4 Pro / QN990F, the first 1× trial selected a cached 1920×1080
+mode. Explicit source selection corrected it. The updated build verified a
+4800×2700 1× / 90Hz source with native 8K60, HDR10 RGB 12-bit full-range output
+and the same logical Dock bounds. Rendering/reconnect tests and universal
+build/signature checks passed. The user reported normal display/cursor/Dock
+operation and acceptable latency, but substantially blurrier text. The trial
+returned to 2× for text clarity; the 1× menu option remains available. This is
+not a measured latency improvement or a confirmed artifact fix, and no real
+HDMI switch was performed for this rendering mode.
 
 ### Faster HDMI switching (build 8.17)
 

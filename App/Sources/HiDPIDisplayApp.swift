@@ -150,14 +150,16 @@ class CustomScaleWindowController {
     private var nativeWidth: UInt32 = 0
     private var nativeHeight: UInt32 = 0
     private var ppi: UInt32 = 140
+    private var renderScale: VirtualRenderScale = .hiDPI
     private var applyCallback: ((PresetConfig) -> Void)?
 
     static let shared = CustomScaleWindowController()
 
-    func show(nativeWidth: UInt32, nativeHeight: UInt32, ppi: UInt32, onApply: @escaping (PresetConfig) -> Void) {
+    func show(nativeWidth: UInt32, nativeHeight: UInt32, ppi: UInt32, renderScale: VirtualRenderScale, onApply: @escaping (PresetConfig) -> Void) {
         self.nativeWidth = nativeWidth
         self.nativeHeight = nativeHeight
         self.ppi = ppi
+        self.renderScale = renderScale
         self.applyCallback = onApply
 
         DispatchQueue.main.async { [weak self] in
@@ -209,7 +211,7 @@ class CustomScaleWindowController {
         // Resolution preview
         let logicalW = UInt32(Double(nativeWidth) / 1.4)
         let logicalH = UInt32(Double(nativeHeight) / 1.4)
-        let resLabel = NSTextField(labelWithString: "Resolution: \(logicalW)×\(logicalH) HiDPI")
+        let resLabel = NSTextField(labelWithString: "Resolution: \(logicalW)×\(logicalH) — \(renderScale.title)")
         resLabel.frame = NSRect(x: 20, y: 75, width: 380, height: 20)
         resLabel.font = NSFont.systemFont(ofSize: 13)
         resLabel.textColor = NSColor.secondaryLabelColor
@@ -242,7 +244,7 @@ class CustomScaleWindowController {
         let logicalH = UInt32(Double(nativeHeight) / scale)
 
         scaleValueLabel?.stringValue = String(format: "%.2fx", scale)
-        resolutionLabel?.stringValue = "Resolution: \(logicalW)×\(logicalH) HiDPI"
+        resolutionLabel?.stringValue = "Resolution: \(logicalW)×\(logicalH) — \(renderScale.title)"
     }
 
     @objc func applyClicked(_ sender: NSButton) {
@@ -264,7 +266,7 @@ class CustomScaleWindowController {
 
         window?.close()
         window = nil
-        applyCallback?(config)
+        applyCallback?(config.rendered(at: renderScale))
     }
 
     @objc func cancelClicked(_ sender: NSButton) {
@@ -2055,12 +2057,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(statusItem)
             menu.addItem(NSMenuItem.separator())
 
-            let disableItem = NSMenuItem(title: "Disable HiDPI", action: #selector(disableHiDPIAction), keyEquivalent: "")
+            let disableItem = NSMenuItem(title: "Disable Virtual Display", action: #selector(disableHiDPIAction), keyEquivalent: "")
             disableItem.target = self
             menu.addItem(disableItem)
             menu.addItem(NSMenuItem.separator())
         } else {
-            let statusItem = NSMenuItem(title: "No HiDPI active", action: nil, keyEquivalent: "")
+            let statusItem = NSMenuItem(title: "No virtual display active", action: nil, keyEquivalent: "")
             statusItem.isEnabled = false
             menu.addItem(statusItem)
             menu.addItem(NSMenuItem.separator())
@@ -2072,6 +2074,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
             menu.addItem(NSMenuItem.separator())
         }
+
+        let renderMenu = NSMenu()
+        for scale in [VirtualRenderScale.hiDPI, .standard] {
+            let item = NSMenuItem(title: scale.title, action: #selector(setVirtualRenderScale(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = scale.rawValue as NSNumber
+            item.state = scale == virtualRenderScale ? .on : .off
+            item.isEnabled = !isSettingUp && !isRestarting
+            renderMenu.addItem(item)
+        }
+        renderMenu.addItem(.separator())
+        let renderNote = NSMenuItem(title: "Same desktop size; 1× may look softer.", action: nil, keyEquivalent: "")
+        renderNote.isEnabled = false
+        renderMenu.addItem(renderNote)
+        if isActive, currentVirtualID != 0, let source = CGDisplayCopyDisplayMode(currentVirtualID) {
+            let pixels = NSMenuItem(title: "Current render: \(source.pixelWidth)×\(source.pixelHeight)", action: nil, keyEquivalent: "")
+            pixels.isEnabled = false
+            renderMenu.addItem(pixels)
+        }
+        let renderItem = NSMenuItem(title: "Virtual Display Rendering", action: nil, keyEquivalent: "")
+        renderItem.submenu = renderMenu
+        menu.addItem(renderItem)
+        menu.addItem(.separator())
 
         let colorMenu = NSMenu()
         colorMenu.delegate = self
@@ -2090,7 +2115,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addPresetItem(to: k8Menu, preset: "8k-4800x2700", title: "4800×2700 (160%)")
         addPresetItem(to: k8Menu, preset: "8k-4384x2466", title: "4384×2466 (≈175%)")
         addPresetItem(to: k8Menu, preset: "8k-4096x2304", title: "4096×2304 (187.5%)")
-        addPresetItem(to: k8Menu, preset: "8k-3840x2160", title: "3840×2160 (200%) - Native 2x")
+        addPresetItem(to: k8Menu, preset: "8k-3840x2160", title: "3840×2160 (200%)")
         addCustomScaleItem(to: k8Menu, nativeWidth: 7680, nativeHeight: 4320, ppi: 163)
 
         let k8Item = NSMenuItem(title: "8K UHD Displays (7680×4320)", action: nil, keyEquivalent: "")
@@ -2545,7 +2570,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
         }
         guard let target = stableOutputTarget() else {
-            note("Enable HiDPI on the connected display first.")
+            note("Enable a virtual display on the connected display first.")
             return
         }
         let manager = VirtualDisplayManager.shared()
@@ -2733,6 +2758,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = setMainDisplay(anchor)
     }
 
+    private var virtualRenderScale: VirtualRenderScale {
+        VirtualRenderScale.preference(UserDefaults.standard.integer(forKey: VirtualRenderScale.preferenceKey))
+    }
+
+    @objc private func setVirtualRenderScale(_ sender: NSMenuItem) {
+        guard !isSettingUp, !isRestarting,
+              let number = sender.representedObject as? NSNumber,
+              let choice = VirtualRenderScale(rawValue: number.intValue),
+              choice != virtualRenderScale else { return }
+        captureHDRBeforeTeardown()
+        UserDefaults.standard.set(choice.rawValue, forKey: VirtualRenderScale.preferenceKey)
+        debugLog("Virtual display rendering: \(choice.title)")
+        if isActive || hasOrphanedVirtualDisplay() {
+            // The saved logical preset is untouched. The next process applies
+            // the new density at creation; output/cadence retain their own prefs.
+            isRestarting = true
+            StatusWindowController.shared.show(message: "Applying \(choice.title)…")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in relaunchApp() }
+        } else {
+            rebuildMenu()
+        }
+    }
+
     private func sourceRefreshRate(for requirement: DisplayTimingRequirement) -> Double {
         VirtualRefreshPolicy.preference(UserDefaults.standard.double(forKey: kVirtualRefreshPolicyKey))
             .sourceRate(for: requirement.refreshRate)
@@ -2840,12 +2888,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let nativeH = info["height"],
               let ppi = info["ppi"] else { return }
 
-        CustomScaleWindowController.shared.show(nativeWidth: nativeW, nativeHeight: nativeH, ppi: ppi) { [weak self] config in
+        CustomScaleWindowController.shared.show(nativeWidth: nativeW, nativeHeight: nativeH, ppi: ppi, renderScale: virtualRenderScale) { [weak self] config in
             self?.applyCustomConfig(config)
         }
     }
 
     func applyCustomConfig(_ config: PresetConfig) {
+        captureHDRBeforeTeardown()
         // User manually applying — reset failure counters for a fresh attempt.
         UserDefaults.standard.set(0, forKey: kConnectionRecoveryCountKey)
         UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
@@ -3111,7 +3160,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return nil
     }
 
-    func createVirtualDisplayAsync(config: PresetConfig, generation: Int) {
+    func createVirtualDisplayAsync(config requestedConfig: PresetConfig, generation: Int) {
+        // All preset, custom, retry and reconnect paths meet here. Recompute
+        // from logical dimensions so density can never halve the desktop size.
+        let config = requestedConfig.rendered(at: virtualRenderScale)
         guard generation == setupGeneration else {
             debugLog("Stale setup (create step) superseded, aborting")
             return
@@ -3171,6 +3223,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func sourceMatches(_ display: CGDirectDisplayID, config: PresetConfig, rate: Double) -> Bool {
+        guard let mode = CGDisplayCopyDisplayMode(display) else { return false }
+        return config.matchesSource(width: mode.width, height: mode.height,
+            pixelWidth: mode.pixelWidth, pixelHeight: mode.pixelHeight) &&
+            abs(mode.refreshRate - rate) <= 0.5
+    }
+
+    private func selectSourceMode(_ display: CGDirectDisplayID, config: PresetConfig, rate: Double) -> Bool {
+        if sourceMatches(display, config: config, rate: rate) { return true }
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        let modes = (CGDisplayCopyAllDisplayModes(display, options) as? [CGDisplayMode]) ?? []
+        debugLog("Source mode selection: \(modes.map { "\($0.width)x\($0.height)/\($0.pixelWidth)x\($0.pixelHeight)@\($0.refreshRate)" }.joined(separator: ", "))")
+        guard let mode = modes.first(where: {
+            $0.isUsableForDesktopGUI() && config.matchesSource(width: $0.width, height: $0.height,
+                pixelWidth: $0.pixelWidth, pixelHeight: $0.pixelHeight) && abs($0.refreshRate - rate) <= 0.5
+        }) else { return false }
+        let result = CGDisplaySetDisplayMode(display, mode, nil)
+        debugLog("Explicit virtual source mode selection: \(result.rawValue)")
+        return result == .success && sourceMatches(display, config: config, rate: rate)
+    }
+
+    private func recoverFromSourceMismatch(config: PresetConfig) {
+        debugLog("Source dimensions mismatch; refusing to keep the wrong desktop mirrored")
+        if !config.hiDPI {
+            // This opt-in change came from the working 2x path. Fall back once
+            // rather than leaving the user on the OS's 1080p default or looping.
+            UserDefaults.standard.set(VirtualRenderScale.hiDPI.rawValue, forKey: VirtualRenderScale.preferenceKey)
+            isRestarting = true
+            setupGeneration += 1
+            StatusWindowController.shared.updateStatus("1× unavailable; restoring HiDPI…")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in relaunchApp() }
+        } else {
+            suspendMirrorForConnection("Virtual source dimensions changed")
+        }
+    }
+
     func performMirror(virtualID: CGDirectDisplayID, externalID: CGDirectDisplayID, config: PresetConfig, generation: Int) {
         guard generation == setupGeneration else {
             debugLog("Stale setup (mirror step) superseded, aborting")
@@ -3188,9 +3276,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             suspendMirrorForConnection("Connection changed between create and mirror")
             return
         }
+        guard selectSourceMode(virtualID, config: config, rate: sourceRefreshRate(for: requirement)) else {
+            recoverFromSourceMismatch(config: config)
+            return
+        }
         let pinRate = requirement.refreshRate
         let success = manager.mirrorDisplay(virtualID, toDisplay: externalID, atRate: pinRate)
         debugLog("Mirror result: \(success)")
+        if success && !sourceMatches(virtualID, config: config, rate: sourceRefreshRate(for: requirement)) {
+            // Establishing a mirror may restore a cached low-resolution choice.
+            // Select our source once more, then restore the independent TV timing.
+            guard selectSourceMode(virtualID, config: config, rate: sourceRefreshRate(for: requirement)),
+                  manager.pinNativeMode(forDisplay: externalID, atRate: pinRate),
+                  sourceMatches(virtualID, config: config, rate: sourceRefreshRate(for: requirement)) else {
+                recoverFromSourceMismatch(config: config)
+                return
+            }
+        }
 
         // Setup is complete (whether successful or not)
         isSettingUp = false
@@ -3201,16 +3303,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             targetExternalDisplayID = externalID  // Track target for disconnect detection
             UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)  // Reset failure counter
             saveMonitorFingerprint(externalID)
-            StatusWindowController.shared.updateStatus("HiDPI enabled: \(config.logicalWidth)x\(config.logicalHeight)")
-            debugLog(">>> HiDPI setup complete, monitoring for disconnect")
+            StatusWindowController.shared.updateStatus("Virtual display enabled: \(config.logicalWidth)x\(config.logicalHeight)")
+            debugLog(">>> Virtual display setup complete, monitoring for disconnect")
 
             // Verify actual backing scale after display configuration settles
-            if config.hiDPI {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                    guard let self = self, generation == self.setupGeneration,
-                          self.isActive, self.currentVirtualID == virtualID else { return }
-                    self.verifyBackingScale(externalID: externalID, config: config)
-                }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self = self, generation == self.setupGeneration,
+                      self.isActive, self.currentVirtualID == virtualID else { return }
+                self.verifyBackingScale(config: config)
             }
 
             // Re-apply physical output and main-display preferences once the mirror
@@ -3255,47 +3355,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
-    func verifyBackingScale(externalID: CGDirectDisplayID, config: PresetConfig) {
-        var actualScale: CGFloat = 0
-        var matchedScreen: NSScreen?
-
-        for screen in NSScreen.screens {
-            let deviceDesc = screen.deviceDescription
-            if let screenNumber = deviceDesc[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
-                if screenNumber == externalID || screenNumber == currentVirtualID {
-                    matchedScreen = screen
-                    actualScale = screen.backingScaleFactor
-                    break
-                }
-            }
-        }
-
-        // Mirrors collapse into a single NSScreen, fall back to main
-        if matchedScreen == nil {
-            if let main = NSScreen.main {
-                matchedScreen = main
-                actualScale = main.backingScaleFactor
-            }
-        }
-
-        let isActuallyHiDPI = actualScale >= 2.0
-        debugLog("Backing scale verification: scale=\(actualScale), isHiDPI=\(isActuallyHiDPI)")
-
-        if let screen = matchedScreen {
-            let frame = screen.frame
-            let visibleFrame = screen.visibleFrame
-            debugLog("  Screen frame: \(frame.width)x\(frame.height), visible: \(visibleFrame.width)x\(visibleFrame.height)")
-        }
-
-        if isActuallyHiDPI {
-            debugLog("Verified: display is running at \(actualScale)x backing scale (true HiDPI)")
-            currentPresetName = "\(config.logicalWidth)x\(config.logicalHeight)"
-            StatusWindowController.shared.updateStatus("HiDPI active: \(config.logicalWidth)x\(config.logicalHeight) @\(Int(actualScale))x")
-        } else {
-            debugLog("WARNING: backing scale is \(actualScale)x — display is NOT in true HiDPI mode")
-            currentPresetName = "\(config.logicalWidth)x\(config.logicalHeight) (1x)"
-            StatusWindowController.shared.updateStatus("\(config.logicalWidth)x\(config.logicalHeight) active (not HiDPI — \(actualScale)x scale)")
-        }
+    func verifyBackingScale(config: PresetConfig) {
+        // Read our source, not the physical mirror or an unrelated main screen.
+        // The physical output deliberately remains native 1:1 in both modes.
+        guard let mode = CGDisplayCopyDisplayMode(currentVirtualID) else { return }
+        let matches = config.matchesSource(width: mode.width, height: mode.height,
+            pixelWidth: mode.pixelWidth, pixelHeight: mode.pixelHeight)
+        let scale = mode.width > 0 ? Double(mode.pixelWidth) / Double(mode.width) : 0
+        debugLog("Source verification: \(mode.width)x\(mode.height), pixels \(mode.pixelWidth)x\(mode.pixelHeight), scale=\(scale), requested match=\(matches)")
+        let label = matches ? (config.hiDPI ? "HiDPI 2×" : "Standard 1×") : "unexpected render size"
+        currentPresetName = "\(mode.width)x\(mode.height) (\(label))"
+        StatusWindowController.shared.updateStatus("\(currentPresetName) active")
+        if !matches { debugLog("WARNING: virtual source dimensions do not match the requested rendering mode") }
 
         rebuildMenu()
 
@@ -3450,7 +3521,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func disableHiDPIAction() {
         // Virtual displays persist until process exit — must restart to truly remove them
         if isActive || hasOrphanedVirtualDisplay() {
-            StatusWindowController.shared.show(message: "Disabling HiDPI...")
+            StatusWindowController.shared.show(message: "Disabling virtual display...")
             isRestarting = true
             // Clear preset so relaunch does NOT restore
             clearSavedPreset()
@@ -3483,16 +3554,6 @@ extension CGDisplayMode {
         return pixelWidth == nativeWidth && pixelHeight == nativeHeight &&
                width == pixelWidth && height == pixelHeight
     }
-}
-
-struct PresetConfig {
-    let name: String
-    let width: UInt32      // Framebuffer width
-    let height: UInt32     // Framebuffer height
-    let logicalWidth: UInt32
-    let logicalHeight: UInt32
-    let ppi: UInt32
-    let hiDPI: Bool
 }
 
 let presetConfigs: [String: PresetConfig] = [
