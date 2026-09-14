@@ -2,7 +2,7 @@
 
 This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
 right-edge Dock repair, persistent physical HDR/color output, and guarded HDMI
-reconnection. Current local experimental build: **8.18** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
+reconnection. Current local experimental build: **8.22** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
 below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -86,6 +86,102 @@ operation and acceptable latency, but substantially blurrier text. The trial
 returned to 2× for text clarity; the 1× menu option remains available. This is
 not a measured latency improvement or a confirmed artifact fix, and no real
 HDMI switch was performed for this rendering mode.
+
+### Returning to the saved monitor (build 8.22)
+
+With **Auto-Apply on Reconnect** enabled, using the laptop display or a different
+external monitor keeps the saved monitor's preset pending. Reconnecting that
+monitor automatically recreates its virtual desktop, including after an app
+restart away from it. The display identity is checked again before a delayed
+restore and during virtual-display setup. Other monitors do not consume the
+pending restore, and disabling HiDPI still clears it.
+
+This applies to every supported external monitor and both standard and custom
+presets. There is no Samsung, 8K, 160%, or 60Hz requirement in the automatic
+restore decision. Monitor identity comes from the connected display's EDID
+vendor/model/serial values, desktop size from the saved preset, and native
+timing from that monitor's capabilities and preferences. The app currently
+remembers **one last-applied monitor and preset**, rather than a separate preset
+history for every monitor. Applying a preset to another monitor updates that
+binding.
+
+Build 8.22 extracts the existing identity matcher and preset resolver into
+shared modules so the tests exercise the same code as the app. Regression
+coverage: `bash App/Tests/run-saved-preset-reconnect-tests.sh` includes all 37
+built-in presets (4K, both ultrawide families, both G9 families, and 8K), custom
+QHD/5K configurations, varied synthetic vendor identities, missing serials,
+and different native refresh rates. It also replays the office/laptop/home
+sequence, process restart, interrupted restore, and intentional disable.
+Capability timeouts and the mirror-failure retry limit remain in effect.
+This is automated logic coverage; the local hardware validation used the
+QN990F and does not claim testing every physical monitor.
+
+### Fast HDMI reconnect (build 8.20, experimental)
+
+**Settings → Fast HDMI Reconnect (Experimental)** enables retained-source
+reconnection and Auto-Apply. It shortens the extra capability wait from two
+seconds to 0.5 seconds, with three matching observations, only when the live
+physical mode already reports the requested native pixel size and fixed
+refresh rate and the same timing is also available in the mode list. The
+returning physical desktop may still use scaled coordinates; cursor-safe
+native 1:1 geometry is still applied and verified before completing recovery.
+Other signals use the existing two-second gate. Missing 60Hz modes cannot
+pass through the fast path, and the 30-second negotiation limit remains.
+
+If macOS has already restored the exact mirror and native fixed geometry,
+the helper verifies it over one second without submitting another display
+transaction. A returning mirror with scaled coordinates is kept for repair
+in place only when its native fixed signal and requested mode are available.
+This avoids detaching and reattaching an otherwise repairable mirror.
+
+Build 8.20 also tries to include the saved HDR/SDR link format in the native
+physical-mode transaction during retained reconnect. It validates the exact
+format against the destination timing's enumerated formats, then verifies
+native 1:1 geometry over the same three observations spanning one second.
+If the driver accepts and retains both settings, the final output check is
+read-only and avoids the separate HDR transaction and its delayed check.
+Unsupported/rejected combinations get one native-only fallback; Automatic
+and any format that does not hold continue through the existing bounded
+output restore. The mirror relationship is still established separately,
+because combining mirror creation with the physical mode can fail on macOS.
+
+In the first real 8.20 reconnect, the combined request succeeded in 1.414
+seconds with fixed 8K60 and HDR10 RGB 12-bit full range. No separate HDR
+transaction was needed. Native-link recognition through final HDR readback
+took 5.18 seconds; the preceding two 8.19 records took about 7.7 seconds.
+The user still saw an initial 4K picture: system logs show 4K120 followed by
+a second unplug/plug before any mirror transaction. The complete system
+hotplug-to-HDR timeline was about 17 seconds, not measured blackout duration.
+
+Turning the option off restores the original reconnect wait and separate
+output restoration, without changing the current picture. Mirror and native-mode
+transaction durations are logged
+separately to distinguish application overhead from the period before the TV
+returns. HDR/color, source density, refresh rates and Dock repair remain under
+the existing verified restore path. No permanent macOS layout save is used.
+
+This cannot keep a physically unplugged HDMI output online or skip HDMI link
+negotiation. A manual software “keep connected” option has the same limit.
+The BetterDisplay author describes this distinction for
+[an equivalent KVM request](https://github.com/waydabber/BetterDisplay/discussions/3783).
+The 0.5-second gate is an application wait reduction, not a claim that a full
+HDMI switch completes in 0.5 seconds. Reconnect, timing, HDR and rendering
+tests, universal compilation, signing and live display readback passed.
+In the earlier 8.19 test, a real M4 Pro / QN990F switch preserved source 108
+and the process, restored
+4800×2700 HiDPI / virtual 90Hz / native 8K60 / HDR10 RGB 12-bit full range,
+and the user confirmed normal cursor and Dock operation.
+
+The fast path took 4.99 seconds from the helper's second, native-8K60 return
+observation to verified mirroring, versus a previous same-preset record of
+6.52 seconds. The user reported no noticeable overall improvement. System
+logs showed an earlier 4K connection, a second unplug/plug event about nine
+seconds later, and then 8K modes appearing. These events preceded the helper's
+mirror transaction. First system hotplug to HDR readback was about 21 seconds;
+this is not a visible-blackout measurement. Later kernel traces identified the extra cycle as USB-C video resource
+contention: an unused dock video output held a display resource for ten seconds
+before HDMI could acquire the additional pipe needed for 8K. Replacing that
+dock with a USB-only hub resolved the extra wait in the user's subsequent test.
 
 ### Faster HDMI switching (build 8.17)
 

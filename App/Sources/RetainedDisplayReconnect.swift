@@ -25,6 +25,7 @@ struct RetainedDisplayReconnect {
     let desktop: RetainedDesktopSignature
     let requirement: DisplayTimingRequirement
     private var readiness = DisplayConnectionReadiness()
+    private var fastReadiness = DisplayConnectionReadiness(stableDuration: 0.5)
     private var linkUnavailable = false
 
     init(desktop: RetainedDesktopSignature, requirement: DisplayTimingRequirement) {
@@ -34,11 +35,13 @@ struct RetainedDisplayReconnect {
 
     mutating func resetProbe() {
         readiness = DisplayConnectionReadiness()
+        fastReadiness = DisplayConnectionReadiness(stableDuration: 0.5)
         linkUnavailable = false
     }
 
     mutating func observe(desktop current: RetainedDesktopSignature?,
-                          capabilities: DisplayLinkCapabilities?, physicalPresent: Bool, at now: TimeInterval) -> Decision {
+                          capabilities: DisplayLinkCapabilities?, physicalPresent: Bool, at now: TimeInterval,
+                          confirmedNativeSignal: Bool = false, fastReconnect: Bool = false) -> Decision {
         guard desktop.matches(current) else { return .rebuild }
         guard physicalPresent else {
             resetProbe()
@@ -48,8 +51,12 @@ struct RetainedDisplayReconnect {
             guard let capabilities = capabilities, requirement.accepts(capabilities) else { return .unavailable }
             resetProbe()
         }
+        // A present mode list alone can precede a working HDMI link. Shorten
+        // the gate only after the live target also reports native fixed scanout.
+        let fastDecision = fastReadiness.observe(fastReconnect && confirmedNativeSignal ? capabilities : nil,
+                                                 requiring: requirement, at: now)
         switch readiness.observe(capabilities, requiring: requirement, at: now) {
-        case .waiting: return .waiting
+        case .waiting: return fastDecision == .ready ? .ready : .waiting
         case .ready: return .ready
         case .timedOut:
             linkUnavailable = true

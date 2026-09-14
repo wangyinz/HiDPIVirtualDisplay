@@ -115,6 +115,45 @@ import Foundation
         check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 602) == .waiting, "60Hz becoming available starts a new stability check")
         _ = recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 603)
         check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 604) == .ready, "Recover same retained source when bandwidth returns")
+        recovery = gate()
+        for t in [0.0, 0.25] {
+            check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: t,
+                                  confirmedNativeSignal: true, fastReconnect: true) == .waiting, "Fast reconnect still needs three matching observations")
+        }
+        check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 0.5,
+                              confirmedNativeSignal: true, fastReconnect: true) == .ready, "Confirmed native signal shortens only the capability wait to 0.5s")
+        for useFast in [false, true] {
+            recovery = gate()
+            for t in [0.0, 0.25, 0.5] {
+                check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: t,
+                                      confirmedNativeSignal: !useFast, fastReconnect: useFast) == .waiting,
+                      "Fast opt-in and native signal are both required")
+            }
+            check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 2,
+                                  confirmedNativeSignal: !useFast, fastReconnect: useFast) == .ready, "Otherwise retain the existing two-second gate")
+        }
+        recovery = gate()
+        for t in [0.0, 0.25, 0.5, 29.0] {
+            check(recovery.observe(desktop: desktop, capabilities: degraded, physicalPresent: true, at: t,
+                                  confirmedNativeSignal: true, fastReconnect: true) == .waiting, "A cached live mode cannot bypass missing 60Hz capability")
+        }
+        check(recovery.observe(desktop: desktop, capabilities: degraded, physicalPresent: true, at: 30,
+                              confirmedNativeSignal: true, fastReconnect: true) == .unavailable, "Fast path retains bounded unavailable-link handling")
+        recovery = gate()
+        _ = recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 0, confirmedNativeSignal: true, fastReconnect: true)
+        _ = recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 0.25, confirmedNativeSignal: false, fastReconnect: true)
+        check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 0.5,
+                              confirmedNativeSignal: true, fastReconnect: true) == .waiting, "A native-signal interruption resets fast stability")
+        _ = recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 0.75, confirmedNativeSignal: true, fastReconnect: true)
+        check(recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 1,
+                              confirmedNativeSignal: true, fastReconnect: true) == .ready, "Stable signal can use fast recovery after a reset")
+        recovery = gate()
+        _ = recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 0, confirmedNativeSignal: true, fastReconnect: true)
+        _ = recovery.observe(desktop: desktop, capabilities: good, physicalPresent: true, at: 0.25, confirmedNativeSignal: true, fastReconnect: true)
+        check(recovery.observe(desktop: desktop, capabilities: changedID, physicalPresent: true, at: 0.5,
+                              confirmedNativeSignal: true, fastReconnect: true) == .waiting, "Changed target resets fast stability")
+        check(recovery.observe(desktop: nil, capabilities: good, physicalPresent: true, at: 0.75,
+                              confirmedNativeSignal: true, fastReconnect: true) == .rebuild, "Fast path never accepts a missing source")
         print("Retained reconnect passed (\(checks) checks)")
     }
 }

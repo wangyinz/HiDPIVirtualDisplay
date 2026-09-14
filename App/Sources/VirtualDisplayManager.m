@@ -11,6 +11,8 @@
 #import <xpc/xpc.h>
 
 static void *VDMSkyLightHandle(void);
+static CGError VDMStageOutputMode(CGDisplayConfigRef config, CGDirectDisplayID displayID,
+                                  int32_t timingID, NSDictionary *mode);
 
 // Compatibility for older SDKs
 #ifndef kIOMainPortDefault
@@ -558,15 +560,21 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
 /// HiDPI desktop geometry intact. Scaled mirror-only modes may be listed by
 /// CoreGraphics but are rejected when explicitly configured (error 1001).
 - (BOOL)pinNativeModeForDisplay:(CGDirectDisplayID)displayID atRate:(double)refreshRate {
+    return [self pinNativeModeForDisplay:displayID atRate:refreshRate outputMode:nil];
+}
+
+- (BOOL)pinNativeModeForDisplay:(CGDirectDisplayID)displayID atRate:(double)refreshRate
+                   outputMode:(NSDictionary<NSString *, NSNumber *> *)outputMode {
     if (refreshRate <= 0 || !CGDisplayIsOnline(displayID)) return NO;
     CGDisplayModeRef desired = CopyBestModeAtRate(displayID, refreshRate);
     if (!desired) return NO;
 
     CGDisplayModeRef current = CGDisplayCopyDisplayMode(displayID);
-    BOOL unchanged = current &&
+    BOOL unchanged = current && VDMVariableRefreshState(displayID) != 1 &&
         CGDisplayModeGetIODisplayModeID(current) == CGDisplayModeGetIODisplayModeID(desired);
     if (current) CGDisplayModeRelease(current);
-    if (unchanged) {
+    if (unchanged && (!outputMode ||
+        [[[self outputStateForDisplay:displayID] objectForKey:@"current"] isEqual:outputMode])) {
         CGDisplayModeRelease(desired);
         return YES;
     }
@@ -574,10 +582,17 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
     NSLog(@"VDM: Pinning physical output %u to %zux%zu @ %.1f Hz",
           displayID, CGDisplayModeGetPixelWidth(desired),
           CGDisplayModeGetPixelHeight(desired), CGDisplayModeGetRefreshRate(desired));
+    CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
     CGDisplayConfigRef config;
     CGError err = CGBeginDisplayConfiguration(&config);
     if (err == kCGErrorSuccess) {
         err = CGConfigureDisplayWithDisplayMode(config, displayID, desired, NULL);
+        if (err == kCGErrorSuccess && outputMode) {
+            // Enumerate formats for the DESTINATION native timing. The current
+            // mirrored/scaled timing may advertise a different set of formats.
+            err = VDMStageOutputMode(config, displayID,
+                CGDisplayModeGetIODisplayModeID(desired), outputMode);
+        }
         if (err == kCGErrorSuccess) {
             err = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
         } else {
@@ -585,14 +600,28 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
         }
     }
     CGDisplayModeRelease(desired);
-    NSLog(@"VDM: Physical pin result: %d; variable-refresh state: %ld",
-          err, (long)VDMVariableRefreshState(displayID));
+    NSInteger variableRefresh = VDMVariableRefreshState(displayID);
+    NSLog(@"VDM: Physical pin result: %d; variable-refresh state: %ld; combined output=%d; elapsed %.3fs",
+          err, (long)variableRefresh, outputMode != nil, CFAbsoluteTimeGetCurrent() - startedAt);
+    if (outputMode && (err != kCGErrorSuccess || variableRefresh == 1)) {
+        // One bounded fallback: preserve the established native-pin path. The
+        // caller still verifies geometry and restores HDR separately if needed.
+        NSLog(@"VDM: Combined native/output request did not hold; falling back to native-only pin");
+        return [self pinNativeModeForDisplay:displayID atRate:refreshRate];
+    }
     return err == kCGErrorSuccess;
 }
 
 - (BOOL)mirrorDisplay:(CGDirectDisplayID)sourceDisplayID
             toDisplay:(CGDirectDisplayID)targetDisplayID
                atRate:(double)refreshRate {
+    return [self mirrorDisplay:sourceDisplayID toDisplay:targetDisplayID atRate:refreshRate outputMode:nil];
+}
+
+- (BOOL)mirrorDisplay:(CGDirectDisplayID)sourceDisplayID
+            toDisplay:(CGDirectDisplayID)targetDisplayID
+               atRate:(double)refreshRate
+           outputMode:(NSDictionary<NSString *, NSNumber *> *)outputMode {
 
     NSLog(@"VDM: Mirror %u -> %u (pin target to %.1f Hz)",
           sourceDisplayID, targetDisplayID, refreshRate);
@@ -623,7 +652,9 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
 
     // Use kCGConfigureForSession instead of kCGConfigurePermanently to avoid
     // triggering ColorSync profile persistence I/O that can stall the daemon.
+    CFAbsoluteTime mirrorStartedAt = CFAbsoluteTimeGetCurrent();
     err = CGCompleteDisplayConfiguration(configRef, kCGConfigureForSession);
+    NSLog(@"VDM: Mirror transaction result: %d; elapsed %.3fs", err, CFAbsoluteTimeGetCurrent() - mirrorStartedAt);
     if (err != kCGErrorSuccess) {
         NSLog(@"VDM: ERROR - Complete config failed: %d", err);
         VDMRestorePinnedMode(targetDisplayID, originalMode);
@@ -633,7 +664,7 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
     // Keep the source's HiDPI desktop, then select the physical native scanout in
     // a separate transaction. Pinning before the mirror is overwritten; combining
     // the two operations in one transaction is rejected on some configurations.
-    if (refreshRate > 0 && ![self pinNativeModeForDisplay:targetDisplayID atRate:refreshRate]) {
+    if (refreshRate > 0 && ![self pinNativeModeForDisplay:targetDisplayID atRate:refreshRate outputMode:outputMode]) {
         NSLog(@"VDM: Physical timing did not apply; undoing this mirror");
         [self stopMirroringForDisplay:targetDisplayID];
         VDMRestorePinnedMode(targetDisplayID, originalMode);
@@ -1117,45 +1148,59 @@ static NSDictionary *VDMOutputDictionary(VDMOutputLink link) {
              @"eotf": @(link.eotf), @"encoding": @(link.encoding)};
 }
 
-- (NSDictionary<NSString *, id> *)outputStateForDisplay:(CGDirectDisplayID)displayID {
-    if (!CGDisplayIsOnline(displayID) || CGDisplayIsBuiltin(displayID) ||
-        [self isVirtualDisplay:displayID]) return nil;
+// Returns link descriptions for an explicitly chosen timing, which need not
+// be the current one. An index is current only when that timing is active.
+static NSDictionary *VDMOutputStateForTiming(CGDirectDisplayID displayID, int32_t modeID) {
     void *handle = VDMSkyLightHandle();
     if (!handle) return nil;
     VDMOutputCountFn countFn = (VDMOutputCountFn)dlsym(handle, "SLSGetDisplayOutputModeCount");
     VDMOutputLinksFn linksFn = (VDMOutputLinksFn)dlsym(handle, "SLSGetDisplayOutputModeLinkDescriptions");
     if (!countFn || !linksFn) return nil;
+    uint32_t count = 0;
+    if (countFn(displayID, modeID, &count) != kCGErrorSuccess || count == 0 || count > 1024) return nil;
+    VDMOutputLink *links = calloc(count, sizeof(VDMOutputLink));
+    if (!links) return nil;
+    uint32_t capacity = count, current = UINT32_MAX;
+    CGError rc = linksFn(displayID, modeID, links, &count, &current);
+    if (rc != kCGErrorSuccess || count > capacity) { free(links); return nil; }
+    NSMutableArray *modes = [NSMutableArray arrayWithCapacity:count];
+    for (uint32_t i = 0; i < count; ++i) [modes addObject:VDMOutputDictionary(links[i])];
+    free(links);
+    NSMutableDictionary *result = [NSMutableDictionary dictionaryWithDictionary:
+        @{@"modes": modes, @"modeID": @(modeID)}];
+    if (current < count) { result[@"current"] = modes[current]; result[@"currentIndex"] = @(current); }
+    return result;
+}
 
-    // A concurrent mode change can invalidate the enumeration. Retry once and
-    // otherwise report unavailable rather than publish a mismatched format.
+static CGError VDMStageOutputMode(CGDisplayConfigRef config, CGDirectDisplayID displayID,
+                                  int32_t timingID, NSDictionary *mode) {
+    NSDictionary *state = VDMOutputStateForTiming(displayID, timingID);
+    if (!state || ![state[@"modes"] containsObject:mode]) return kCGErrorIllegalArgument;
+    void *handle = VDMSkyLightHandle();
+    VDMConfigureOutputFn configure = handle ?
+        (VDMConfigureOutputFn)dlsym(handle, "SLSConfigureDisplayOutputMode") : NULL;
+    if (!configure) return kCGErrorNotImplemented;
+    uint64_t first = [mode[@"bitsPerComponent"] unsignedIntValue] |
+                     ((uint64_t)[mode[@"range"] unsignedIntValue] << 32);
+    uint64_t second = [mode[@"eotf"] unsignedIntValue] |
+                      ((uint64_t)[mode[@"encoding"] unsignedIntValue] << 32);
+    return configure(config, displayID, first, second);
+}
+
+- (NSDictionary<NSString *, id> *)outputStateForDisplay:(CGDirectDisplayID)displayID {
+    if (!CGDisplayIsOnline(displayID) || CGDisplayIsBuiltin(displayID) ||
+        [self isVirtualDisplay:displayID]) return nil;
+    // A concurrent mode change can invalidate the enumeration. Retry once.
     for (int attempt = 0; attempt < 2; ++attempt) {
         CGDisplayModeRef timing = CGDisplayCopyDisplayMode(displayID);
         if (!timing) return nil;
         int32_t modeID = CGDisplayModeGetIODisplayModeID(timing);
         CGDisplayModeRelease(timing);
-        uint32_t count = 0;
-        if (countFn(displayID, modeID, &count) != kCGErrorSuccess || count == 0 || count > 1024) return nil;
-        VDMOutputLink *links = calloc(count, sizeof(VDMOutputLink));
-        if (!links) return nil;
-        uint32_t capacity = count, current = UINT32_MAX;
-        CGError rc = linksFn(displayID, modeID, links, &count, &current);
+        NSDictionary *state = VDMOutputStateForTiming(displayID, modeID);
         timing = CGDisplayCopyDisplayMode(displayID);
         BOOL sameTiming = timing && CGDisplayModeGetIODisplayModeID(timing) == modeID;
         if (timing) CGDisplayModeRelease(timing);
-        if (rc != kCGErrorSuccess || count > capacity || !sameTiming) {
-            free(links);
-            continue;
-        }
-        NSMutableArray *modes = [NSMutableArray arrayWithCapacity:count];
-        for (uint32_t i = 0; i < count; ++i) [modes addObject:VDMOutputDictionary(links[i])];
-        free(links);
-        NSMutableDictionary *result = [NSMutableDictionary dictionaryWithDictionary:
-            @{@"modes": modes, @"modeID": @(modeID)}];
-        if (current < count) {
-            result[@"current"] = modes[current];
-            result[@"currentIndex"] = @(current);
-        }
-        return result;
+        if (state && sameTiming) return state;
     }
     return nil;
 }
@@ -1169,18 +1214,10 @@ static NSDictionary *VDMOutputDictionary(VDMOutputLink link) {
         NSLog(@"VDM: output format unavailable for display %u: %@", displayID, mode);
         return NO;
     }
-    void *handle = VDMSkyLightHandle();
-    VDMConfigureOutputFn configure = handle ?
-        (VDMConfigureOutputFn)dlsym(handle, "SLSConfigureDisplayOutputMode") : NULL;
-    if (!configure) return NO;
-    uint64_t first = [mode[@"bitsPerComponent"] unsignedIntValue] |
-                     ((uint64_t)[mode[@"range"] unsignedIntValue] << 32);
-    uint64_t second = [mode[@"eotf"] unsignedIntValue] |
-                      ((uint64_t)[mode[@"encoding"] unsignedIntValue] << 32);
     CGDisplayConfigRef config = NULL;
     CGError rc = CGBeginDisplayConfiguration(&config);
     if (rc == kCGErrorSuccess) {
-        rc = configure(config, displayID, first, second);
+        rc = VDMStageOutputMode(config, displayID, [state[@"modeID"] intValue], mode);
         if (rc == kCGErrorSuccess) rc = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
         else CGCancelDisplayConfiguration(config);
     }

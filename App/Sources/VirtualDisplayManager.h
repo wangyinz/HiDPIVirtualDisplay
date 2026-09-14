@@ -86,6 +86,17 @@ BOOL VDMApplyVirtualCompositionBudget(id settings, double milliseconds,
 /// the source desktop. Returns whether the configuration request succeeded.
 - (BOOL)pinNativeModeForDisplay:(CGDirectDisplayID)displayID atRate:(double)refreshRate;
 
+/// Fast retained reconnect: combine the native pin with an exact saved link
+/// format offered for that native timing. nil uses the established sequence.
+/// Rejected combinations fall back once to native-only pinning; callers must
+/// verify both the physical geometry and actual output format afterward.
+- (BOOL)pinNativeModeForDisplay:(CGDirectDisplayID)displayID atRate:(double)refreshRate
+                   outputMode:(nullable NSDictionary<NSString *, NSNumber *> *)outputMode;
+- (BOOL)mirrorDisplay:(CGDirectDisplayID)sourceDisplayID
+            toDisplay:(CGDirectDisplayID)targetDisplayID
+               atRate:(double)refreshRate
+           outputMode:(nullable NSDictionary<NSString *, NSNumber *> *)outputMode;
+
 /// Keep Dock on our virtual source when an inactive, mirrored physical display
 /// incorrectly captures the desktop edge. Only applies to a single active
 /// desktop. Uses a bounded, asynchronous request; display modes are unchanged.

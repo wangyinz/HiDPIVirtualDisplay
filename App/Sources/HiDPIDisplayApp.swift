@@ -680,6 +680,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let kAutoRestoreKey = "autoRestoreOnCrash"
     private let kAutoApplyOnConnectKey = "autoApplyOnConnect"
     private let kRetainVirtualOnDisconnectKey = "retainVirtualDisplayOnDisconnect"
+    private let kFastHDMIReconnectKey = "fastHDMIReconnect"
     private var retainedReconnect: RetainedDisplayReconnect?
     private var retainedReconnectWorkItem: DispatchWorkItem?
     private var retainedReconnectStartedAt: TimeInterval?
@@ -704,7 +705,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let kBoundMonitorSerialKey = "boundMonitorSerial"
 
     // Track if we're waiting for monitor reconnection
-    private var wasDisconnected = false
+    private var savedPresetReconnect = SavedPresetReconnect()
+    private var wasDisconnected: Bool {
+        get { savedPresetReconnect.pending }
+        set { savedPresetReconnect.pending = newValue }
+    }
+    private var savedPresetRestoreWorkItem: DispatchWorkItem?
+    private var savedPresetRestoreToken = 0
+    private var automaticRestoreGeneration: Int?
 
     // Track if we're in the middle of setting up HiDPI (don't trigger cleanup during setup)
     private var isSettingUp = false
@@ -911,7 +919,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             debugLog(">>> Screens did wake")
             self?.screensAsleep = false
             self?.beginOutputRestore()
-            _ = self?.handleRetainedDisplayConnection()
+            self?.handleDisplayConfigurationChange()
             self?.scheduleFixedRefreshCheck()
             // The panel takes a few seconds to re-enumerate; the display-change
             // notification then repairs the mirror if it broke. The periodic
@@ -921,12 +929,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         debugLog("Display change monitoring started (notification + timer + wake + screen sleep)")
         // The monitor may already be back before the cleanup process restarts;
         // a new notification is not guaranteed. Start the readiness check now.
-        if wasDisconnected {
-            DispatchQueue.main.async { [weak self] in self?.handleDisplayConfigurationChange() }
-        }
+        DispatchQueue.main.async { [weak self] in self?.handleDisplayConfigurationChange() }
     }
 
     func stopDisplayChangeMonitoring() {
+        cancelSavedPresetRestore()
         outputObservationTimer?.invalidate()
         outputObservationTimer = nil
         if outputCallbackRegistered {
@@ -993,31 +1000,69 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        // A timed-out capability probe remains idle until the link changes or
-        // the user explicitly retries. Do not repeat setup every 30 seconds.
-        if !isActive && !shouldRetryConnection(on: realMonitor) { return }
+        attemptSavedPresetReconnect(after: 0)
+    }
 
-        // Case 2: HiDPI not active, monitor reconnected, auto-apply enabled
-        if !isActive && wasDisconnected && realMonitor != nil {
-            let failCount = UserDefaults.standard.integer(forKey: kMirrorFailureCountKey)
-            if failCount >= maxMirrorRetries {
-                debugLog(">>> Periodic check: Monitor present but mirror failed \(failCount) times, not retrying (apply manually from menu)")
+    private func cancelSavedPresetRestore() {
+        savedPresetRestoreWorkItem?.cancel()
+        savedPresetRestoreWorkItem = nil
+        savedPresetRestoreToken += 1
+    }
+
+    /// A different monitor must not consume the saved monitor's reconnect.
+    /// All inactive paths share this decision, including startup and wake.
+    private func attemptSavedPresetReconnect(after delay: TimeInterval = 2) {
+        guard !isActive, !isSettingUp, !isRestarting, !screensAsleep else { return }
+        let defaults = UserDefaults.standard
+        let preset = defaults.string(forKey: kLastPresetKey)
+        let hasBinding = defaults.object(forKey: kBoundMonitorVendorKey) != nil
+        let target = hasBinding ? boundPhysicalDisplay() : findRealPhysicalMonitor()
+        let previouslyPending = wasDisconnected
+        let decision = savedPresetReconnect.observe(
+            targetPresent: target != nil,
+            enabled: defaults.bool(forKey: kAutoApplyOnConnectKey),
+            hasSavedPreset: !(preset ?? "").isEmpty)
+        if wasDisconnected != previouslyPending {
+            defaults.set(wasDisconnected, forKey: kWasDisconnectedKey)
+        }
+        switch decision {
+        case .idle:
+            cancelSavedPresetRestore()
+        case .waiting:
+            cancelSavedPresetRestore()
+            if !previouslyPending {
+                debugLog("Saved monitor absent; keeping its preset pending across other displays")
+            }
+        case .ready:
+            guard savedPresetRestoreWorkItem == nil, let preset = preset,
+                  shouldRetryConnection(on: target) else { return }
+            let failures = defaults.integer(forKey: kMirrorFailureCountKey)
+            let recoveries = defaults.integer(forKey: kConnectionRecoveryCountKey)
+            guard failures < maxMirrorRetries, recoveries <= 3 else {
+                debugLog("Automatic restore paused after repeated failures: mirror=\(failures), connection=\(recoveries)")
                 wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+                defaults.set(false, forKey: kWasDisconnectedKey)
                 return
             }
-
-            let autoApply = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey)
-            if autoApply, let lastPreset = UserDefaults.standard.string(forKey: kLastPresetKey), !lastPreset.isEmpty {
-                if !connectedMonitorMatchesSavedPreset() {
-                    debugLog(">>> Periodic check: Monitor present but doesn't match saved preset — skipping auto-apply")
-                    return
-                }
-                debugLog(">>> Periodic check: Monitor reconnected - auto-applying \(lastPreset)")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-                restorePreset(lastPreset)
+            let generation = setupGeneration
+            savedPresetRestoreToken += 1
+            let token = savedPresetRestoreToken
+            let work = DispatchWorkItem { [weak self] in
+                guard let self = self, token == self.savedPresetRestoreToken else { return }
+                self.savedPresetRestoreWorkItem = nil
+                guard generation == self.setupGeneration, !self.isActive,
+                      !self.isSettingUp, !self.isRestarting, !self.screensAsleep,
+                      defaults.bool(forKey: self.kAutoApplyOnConnectKey),
+                      defaults.string(forKey: self.kLastPresetKey) == preset,
+                      self.findRealPhysicalMonitor() != nil,
+                      self.connectedMonitorMatchesSavedPreset() else { return }
+                debugLog("Saved monitor returned; automatically restoring \(preset)")
+                self.wasDisconnected = false
+                defaults.set(false, forKey: self.kWasDisconnectedKey)
+                self.restorePreset(preset)
             }
+            savedPresetRestoreWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
     }
 
@@ -1032,6 +1077,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             retainedReconnect?.resetProbe()
             retainedMirrorVerification = nil
             _ = handleRetainedDisplayConnection()
+            return
+        }
+
+        if !isActive {
+            attemptSavedPresetReconnect()
             return
         }
 
@@ -1077,13 +1127,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 debugLog("Wake: no external monitor after \(attempt) attempts, leaving restore to reconnect handling")
                 isSettingUp = false
+                attemptSavedPresetReconnect()
             }
             return
         }
 
         if !connectedMonitorMatchesSavedPreset() {
-            debugLog("Wake: connected monitor doesn't match saved preset — skipping restore")
+            debugLog("Wake: connected monitor doesn't match saved preset — keeping restore pending")
             isSettingUp = false
+            wasDisconnected = true
+            UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
             return
         }
 
@@ -1324,49 +1377,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        // Case 2: HiDPI is not active, check if monitor was reconnected
-        let realMonitor = findRealPhysicalMonitor(verbose: true)
-        if !isActive && realMonitor != nil && wasDisconnected {
-            guard shouldRetryConnection(on: realMonitor) else { return }
-            let failCount = UserDefaults.standard.integer(forKey: kMirrorFailureCountKey)
-            if failCount >= maxMirrorRetries {
-                debugLog("Display reconnected but mirror failed \(failCount) times, not retrying (apply manually from menu)")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-                return
-            }
-
-            debugLog("External display reconnected")
-
-            let autoApply = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey)
-            if autoApply, let lastPreset = UserDefaults.standard.string(forKey: kLastPresetKey), !lastPreset.isEmpty {
-                if !connectedMonitorMatchesSavedPreset() {
-                    debugLog("Display reconnected but doesn't match saved preset — skipping auto-apply")
-                    wasDisconnected = false
-                    UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-                    return
-                }
-                debugLog("Auto-applying last preset: \(lastPreset)")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-
-                // Delay to let the display settle. Generation-guarded so a
-                // manual apply during the delay isn't clobbered by this
-                // stale reconnect restore.
-                let generation = setupGeneration
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                    guard let self = self, generation == self.setupGeneration else {
-                        debugLog("Reconnect restore superseded by newer action, skipping")
-                        return
-                    }
-                    self.restorePreset(lastPreset)
-                }
-            } else {
-                debugLog("Auto-apply disabled or no saved preset")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-            }
-        }
+        attemptSavedPresetReconnect()
     }
 
     // Find a real physical monitor (not built-in, not virtual, not a ghost/phantom display)
@@ -1577,9 +1588,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 connectionRecoveryBlocked = false
                 rememberStableTiming(recovery.requirement, for: target)
                 reassertPreferencesAfterSetup()
-                // This path has already verified native fixed timing for a
-                // full second. Start HDR now; the normal delayed check remains
-                // responsible for verifying its result and any VRR correction.
+                // Native fixed geometry has been stable for a full second.
+                // A combined native/HDR commit can now finish by readback alone;
+                // a rejected or ineffective combination uses the usual restore.
                 restoreOutputPreferenceIfNeeded()
                 rebuildMenu()
             }
@@ -1590,22 +1601,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             debugLog("Retained desktop: monitor returned; validating native timing")
             logRetainedLinkState(target!, label: "first return")
         }
-        // macOS can automatically restore a mirror with stale scaled coordinates.
-        // Detach only that invalid target while waiting, keeping the virtual
-        // object alive so the old clipped/mis-mapped cursor cannot persist.
-        if let target = target, CGDisplayMirrorsDisplay(target) == currentVirtualID,
-           !physicalTimingMatches(target, requirement: recovery.requirement, requiresFixedRefresh: false) {
-            guard VirtualDisplayManager.shared().stopMirroring(forDisplay: target) else {
-                clearRetainedReconnect()
-                suspendMirrorForConnection("Could not detach stale retained mirror coordinates")
-                return
-            }
-            guard generation == setupGeneration, retainedReconnect != nil, !isRestarting else { return }
-            debugLog("Retained desktop: detached stale target coordinates while waiting for native timing")
+        let fastReconnect = UserDefaults.standard.bool(forKey: kFastHDMIReconnectKey)
+        let confirmedNativeSignal: Bool = target.flatMap(CGDisplayCopyDisplayMode).map { mode in
+            // The returning 4K logical desktop can already have an 8K60
+            // backing mode. It is safe to shorten only the capability wait;
+            // final cursor-safe 1:1 target geometry is still verified below.
+            mode.pixelWidth == recovery.requirement.width && mode.pixelHeight == recovery.requirement.height &&
+                mode.refreshRate.isFinite && abs(mode.refreshRate - recovery.requirement.refreshRate) <= 0.5 &&
+                target.map { VDMVariableRefreshState($0) == 0 } == true
+        } ?? false
+        if fastReconnect, confirmedNativeSignal,
+           capabilities.map(recovery.requirement.accepts) == true, let target = target,
+           recovery.desktop.matches(ownedDesktopSignature()),
+           CGDisplayMirrorsDisplay(target) == currentVirtualID,
+           physicalTimingMatches(target, requirement: recovery.requirement) {
+            targetExternalDisplayID = target
+            prepareOutputPreference(for: target)
+            debugLog("Retained desktop: existing mirror already correct; verifying without a display transaction")
+            startRetainedMirrorVerification(target: target, recovery: recovery)
+            return
         }
         let decision = recovery.observe(desktop: ownedDesktopSignature(), capabilities: capabilities,
-                                        physicalPresent: target != nil, at: now)
+                                        physicalPresent: target != nil, at: now,
+                                        confirmedNativeSignal: confirmedNativeSignal, fastReconnect: fastReconnect)
         retainedReconnect = recovery
+        // Keep a returning mirror for in-place native repair only when the
+        // fast path has confirmed the live native signal and available mode.
+        // Otherwise retain the cursor-safe detach fallback while waiting.
+        if let target = target, CGDisplayMirrorsDisplay(target) == currentVirtualID,
+           !physicalTimingMatches(target, requirement: recovery.requirement, requiresFixedRefresh: false) {
+            let canRepairInPlace = fastReconnect && confirmedNativeSignal &&
+                capabilities.map(recovery.requirement.accepts) == true && decision != .unavailable && decision != .rebuild
+            if canRepairInPlace {
+                debugLog("Retained desktop: keeping returning mirror for in-place native repair")
+            } else {
+                guard VirtualDisplayManager.shared().stopMirroring(forDisplay: target) else {
+                    clearRetainedReconnect()
+                    suspendMirrorForConnection("Could not detach stale retained mirror coordinates")
+                    return
+                }
+                guard generation == setupGeneration, retainedReconnect != nil, !isRestarting else { return }
+                debugLog("Retained desktop: detached stale target coordinates while waiting for native timing")
+            }
+        }
         switch decision {
         case .disconnected:
             retainedReconnectStartedAt = nil
@@ -1634,10 +1672,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             targetExternalDisplayID = target
             prepareOutputPreference(for: target)
             let alreadyMirrored = CGDisplayMirrorsDisplay(target) == currentVirtualID
+            debugLog(String(format: "Retained desktop: native readiness %.3fs, fast=%@, confirmed signal=%@",
+                            now - (retainedReconnectStartedAt ?? now), String(fastReconnect), String(confirmedNativeSignal)))
             logRetainedLinkState(target, label: "before mirror transaction")
+            // Only an explicit, saved format can be staged with the physical
+            // timing. Automatic and unsupported formats retain separate restore.
+            let preference = outputPreference(for: target)
+            let outputMode = fastReconnect && !forceAutomaticOutput
+                ? preference.flatMap { $0.mode(forHDR: $0.hdrEnabled) } : nil
+            debugLog("Retained desktop: native/output transaction preference: \(outputMode?.statusTitle ?? "separate restore")")
             let ok = alreadyMirrored
-                ? manager.pinNativeMode(forDisplay: target, atRate: recovery.requirement.refreshRate)
-                : manager.mirrorDisplay(currentVirtualID, toDisplay: target, atRate: recovery.requirement.refreshRate)
+                ? manager.pinNativeMode(forDisplay: target, atRate: recovery.requirement.refreshRate,
+                                        outputMode: outputMode?.dictionary)
+                : manager.mirrorDisplay(currentVirtualID, toDisplay: target, atRate: recovery.requirement.refreshRate,
+                                        outputMode: outputMode?.dictionary)
             guard generation == setupGeneration, retainedReconnect != nil, !isRestarting else { return }
             guard ok else {
                 clearRetainedReconnect()
@@ -1645,18 +1693,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             logRetainedLinkState(target, label: "transaction returned; awaiting readback")
-            let verificationStartedAt = ProcessInfo.processInfo.systemUptime
-            var verification = RetainedMirrorVerification(targetDisplayID: target,
-                desktop: recovery.desktop, startedAt: verificationStartedAt)
-            _ = verification.observe(desktop: ownedDesktopSignature(),
-                mirrorMatches: CGDisplayMirrorsDisplay(target) == currentVirtualID,
-                physicalMatches: physicalTimingMatches(target, requirement: recovery.requirement),
-                at: verificationStartedAt)
-            retainedMirrorVerification = verification
-            scheduleRetainedMirrorCheck(after: 0.5)
+            startRetainedMirrorVerification(target: target, recovery: recovery)
             return
         }
-        scheduleRetainedMirrorCheck()
+        scheduleRetainedMirrorCheck(after: fastReconnect && confirmedNativeSignal ? 0.25 : 1)
+    }
+
+    private func startRetainedMirrorVerification(target: CGDirectDisplayID, recovery: RetainedDisplayReconnect) {
+        let now = ProcessInfo.processInfo.systemUptime
+        var verification = RetainedMirrorVerification(targetDisplayID: target,
+            desktop: recovery.desktop, startedAt: now)
+        _ = verification.observe(desktop: ownedDesktopSignature(),
+            mirrorMatches: CGDisplayMirrorsDisplay(target) == currentVirtualID,
+            physicalMatches: physicalTimingMatches(target, requirement: recovery.requirement), at: now)
+        retainedMirrorVerification = verification
+        scheduleRetainedMirrorCheck(after: 0.5)
     }
 
     private func logRetainedLinkState(_ target: CGDirectDisplayID, label: String) {
@@ -1915,22 +1966,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func restorePreset(_ presetName: String) {
+        guard findRealPhysicalMonitor() != nil, connectedMonitorMatchesSavedPreset() else {
+            debugLog("Saved monitor absent before restore; waiting without creating a virtual display")
+            isSettingUp = false
+            wasDisconnected = true
+            UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
+            return
+        }
         let migratedName = migratePresetName(presetName)
-        let config: PresetConfig
-
-        if let standard = presetConfigs[migratedName] {
-            config = standard
-        } else if presetName.hasPrefix("custom-"),
-                  let dict = UserDefaults.standard.dictionary(forKey: "customPresetConfig"),
-                  let name = dict["name"] as? String,
-                  let width = (dict["width"] as? NSNumber)?.uint32Value,
-                  let height = (dict["height"] as? NSNumber)?.uint32Value,
-                  let logicalWidth = (dict["logicalWidth"] as? NSNumber)?.uint32Value,
-                  let logicalHeight = (dict["logicalHeight"] as? NSNumber)?.uint32Value,
-                  let ppi = (dict["ppi"] as? NSNumber)?.uint32Value,
-                  let hiDPI = dict["hiDPI"] as? Bool {
-            config = PresetConfig(name: name, width: width, height: height, logicalWidth: logicalWidth, logicalHeight: logicalHeight, ppi: ppi, hiDPI: hiDPI)
-        } else {
+        guard let config = resolveSavedPreset(migratedName,
+            custom: UserDefaults.standard.dictionary(forKey: "customPresetConfig")) else {
             debugLog("ERROR: Unknown preset for restore: \(presetName) (migrated: \(migratedName))")
             // Callers (e.g. the wake path) may have set isSettingUp before
             // calling us — clear it or disconnect/reconnect handling stays
@@ -1953,6 +1998,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isSettingUp = true
         setupGeneration += 1
         let generation = setupGeneration
+        automaticRestoreGeneration = generation
 
         StatusWindowController.shared.show(message: "Restoring display configuration...")
 
@@ -2221,6 +2267,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         retainItem.toolTip = "Keep the desktop ready while the TV is away. Requires Auto-Apply; releases it when another real screen is in use."
         settingsMenu.addItem(retainItem)
 
+        let fastReconnectItem = NSMenuItem(title: "Fast HDMI Reconnect (Experimental)", action: #selector(toggleFastHDMIReconnect(_:)), keyEquivalent: "")
+        fastReconnectItem.target = self
+        fastReconnectItem.state = UserDefaults.standard.bool(forKey: kFastHDMIReconnectKey) ? .on : .off
+        fastReconnectItem.toolTip = "Reuse an existing mirror; shorten the extra wait to 0.5 seconds when native fixed output is already reported. HDMI link negotiation still applies."
+        settingsMenu.addItem(fastReconnectItem)
+
         let autoRestoreItem = NSMenuItem(title: "Auto-Restore After Crash", action: #selector(toggleAutoRestore(_:)), keyEquivalent: "")
         autoRestoreItem.target = self
         autoRestoreItem.state = UserDefaults.standard.bool(forKey: kAutoRestoreKey) ? .on : .off
@@ -2389,6 +2441,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
+    @objc func toggleFastHDMIReconnect(_ sender: NSMenuItem) {
+        guard !isSettingUp, !isRestarting, !retainedReconnectOperation.isRunning else { return }
+        let enabled = !UserDefaults.standard.bool(forKey: kFastHDMIReconnectKey)
+        UserDefaults.standard.set(enabled, forKey: kFastHDMIReconnectKey)
+        if enabled {
+            UserDefaults.standard.set(true, forKey: kRetainVirtualOnDisconnectKey)
+            UserDefaults.standard.set(true, forKey: kAutoApplyOnConnectKey)
+        }
+        retainedReconnect?.resetProbe()
+        debugLog("Fast HDMI reconnect: \(enabled)")
+        rebuildMenu()
+    }
+
     @objc func toggleAutoRestore(_ sender: NSMenuItem) {
         let current = UserDefaults.standard.bool(forKey: kAutoRestoreKey)
         UserDefaults.standard.set(!current, forKey: kAutoRestoreKey)
@@ -2442,6 +2507,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func handleOutputTopologyChange(_ display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
         if flags.contains(.removeFlag) || flags.contains(.addFlag) {
             if handleRetainedDisplayConnection() { return }
+            attemptSavedPresetReconnect()
         }
         guard isActive, display == targetExternalDisplayID else { return }
         if flags.contains(.removeFlag) || flags.contains(.addFlag) {
@@ -3168,6 +3234,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             debugLog("Stale setup (create step) superseded, aborting")
             return
         }
+        if automaticRestoreGeneration == generation && !connectedMonitorMatchesSavedPreset() {
+            debugLog("Saved monitor left during setup; returning to pending reconnect")
+            isSettingUp = false
+            wasDisconnected = true
+            UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
+            connectionRecoveryMessage = nil
+            outputRestore.finish()
+            StatusWindowController.shared.hide()
+            rebuildMenu()
+            return
+        }
         debugLog("Creating virtual display: \(config.width)x\(config.height)")
 
         let external = findExternalDisplay()
@@ -3446,14 +3523,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// wrongly block auto-restore. Serial is the stable identifier.
     func displayMatchesSavedFingerprint(_ displayID: CGDirectDisplayID) -> Bool {
         guard UserDefaults.standard.object(forKey: kBoundMonitorVendorKey) != nil else { return false }
-        let savedVendor = UserDefaults.standard.integer(forKey: kBoundMonitorVendorKey)
-        let savedModel = UserDefaults.standard.integer(forKey: kBoundMonitorModelKey)
-        let savedSerial = UserDefaults.standard.integer(forKey: kBoundMonitorSerialKey)
-
-        guard Int(CGDisplayVendorNumber(displayID)) == savedVendor else { return false }
-        if Int(CGDisplayModelNumber(displayID)) == savedModel { return true }
-        let serial = Int(CGDisplaySerialNumber(displayID))
-        return savedSerial != 0 && serial != 0 && serial == savedSerial
+        let saved = SavedMonitorFingerprint(
+            vendor: UserDefaults.standard.integer(forKey: kBoundMonitorVendorKey),
+            model: UserDefaults.standard.integer(forKey: kBoundMonitorModelKey),
+            serial: UserDefaults.standard.integer(forKey: kBoundMonitorSerialKey))
+        return saved.matches(SavedMonitorFingerprint(vendor: Int(CGDisplayVendorNumber(displayID)),
+            model: Int(CGDisplayModelNumber(displayID)), serial: Int(CGDisplaySerialNumber(displayID))))
     }
 
     func connectedMonitorMatchesSavedPreset() -> Bool {
@@ -3555,57 +3630,3 @@ extension CGDisplayMode {
                width == pixelWidth && height == pixelHeight
     }
 }
-
-let presetConfigs: [String: PresetConfig] = [
-    // 8K UHD (7680x4320 native). All presets preserve 16:9 and use a
-    // framebuffer twice the logical dimensions in each direction.
-    // 175% is rounded to the nearest 16:9 integer size (actual scale ~175.18%).
-    "8k-6144x3456": PresetConfig(name: "8K-6144", width: 12288, height: 6912, logicalWidth: 6144, logicalHeight: 3456, ppi: 163, hiDPI: true),
-    "8k-5760x3240": PresetConfig(name: "8K-5760", width: 11520, height: 6480, logicalWidth: 5760, logicalHeight: 3240, ppi: 163, hiDPI: true),
-    "8k-5120x2880": PresetConfig(name: "8K-5120", width: 10240, height: 5760, logicalWidth: 5120, logicalHeight: 2880, ppi: 163, hiDPI: true),
-    "8k-4800x2700": PresetConfig(name: "8K-4800", width: 9600, height: 5400, logicalWidth: 4800, logicalHeight: 2700, ppi: 163, hiDPI: true),
-    "8k-4384x2466": PresetConfig(name: "8K-4384", width: 8768, height: 4932, logicalWidth: 4384, logicalHeight: 2466, ppi: 163, hiDPI: true),
-    "8k-4096x2304": PresetConfig(name: "8K-4096", width: 8192, height: 4608, logicalWidth: 4096, logicalHeight: 2304, ppi: 163, hiDPI: true),
-    "8k-3840x2160": PresetConfig(name: "8K-3840", width: 7680, height: 4320, logicalWidth: 3840, logicalHeight: 2160, ppi: 163, hiDPI: true),
-
-    // Samsung G9 57" (7680x2160 native) - Fractional scaling options
-    // Scale factor = native / logical, e.g., 7680/5120 = 1.5x
-    "g9-57-6144x1728": PresetConfig(name: "G9-57-6144", width: 12288, height: 3456, logicalWidth: 6144, logicalHeight: 1728, ppi: 140, hiDPI: true),  // 1.25x
-    "g9-57-5908x1662": PresetConfig(name: "G9-57-5908", width: 11816, height: 3324, logicalWidth: 5908, logicalHeight: 1662, ppi: 140, hiDPI: true),  // 1.3x
-    "g9-57-5632x1584": PresetConfig(name: "G9-57-5632", width: 11264, height: 3168, logicalWidth: 5632, logicalHeight: 1584, ppi: 140, hiDPI: true),  // 1.36x
-    "g9-57-5486x1543": PresetConfig(name: "G9-57-5486", width: 10972, height: 3086, logicalWidth: 5486, logicalHeight: 1543, ppi: 140, hiDPI: true),  // 1.4x
-    "g9-57-5297x1490": PresetConfig(name: "G9-57-5297", width: 10594, height: 2980, logicalWidth: 5297, logicalHeight: 1490, ppi: 140, hiDPI: true),  // 1.45x
-    "g9-57-5120x1440": PresetConfig(name: "G9-57-5120", width: 10240, height: 2880, logicalWidth: 5120, logicalHeight: 1440, ppi: 140, hiDPI: true),  // 1.5x (recommended)
-    "g9-57-4800x1350": PresetConfig(name: "G9-57-4800", width: 9600, height: 2700, logicalWidth: 4800, logicalHeight: 1350, ppi: 140, hiDPI: true),   // 1.6x
-    "g9-57-4389x1234": PresetConfig(name: "G9-57-4389", width: 8778, height: 2468, logicalWidth: 4389, logicalHeight: 1234, ppi: 140, hiDPI: true),   // 1.75x
-    "g9-57-3840x1080": PresetConfig(name: "G9-57-3840", width: 7680, height: 2160, logicalWidth: 3840, logicalHeight: 1080, ppi: 140, hiDPI: true),   // 2.0x (native HiDPI)
-
-    // Samsung G9 49" (5120x1440 native) - Fractional scaling options
-    "g9-49-4096x1152": PresetConfig(name: "G9-49-4096", width: 8192, height: 2304, logicalWidth: 4096, logicalHeight: 1152, ppi: 109, hiDPI: true),   // 1.25x
-    "g9-49-3938x1108": PresetConfig(name: "G9-49-3938", width: 7876, height: 2216, logicalWidth: 3938, logicalHeight: 1108, ppi: 109, hiDPI: true),   // 1.3x
-    "g9-49-3840x1080": PresetConfig(name: "G9-49-3840", width: 7680, height: 2160, logicalWidth: 3840, logicalHeight: 1080, ppi: 109, hiDPI: true),   // 1.33x
-    "g9-49-3413x960": PresetConfig(name: "G9-49-3413", width: 6826, height: 1920, logicalWidth: 3413, logicalHeight: 960, ppi: 109, hiDPI: true),     // 1.5x (recommended)
-    "g9-49-2926x823": PresetConfig(name: "G9-49-2926", width: 5852, height: 1646, logicalWidth: 2926, logicalHeight: 823, ppi: 109, hiDPI: true),     // 1.75x
-    "g9-49-2560x720": PresetConfig(name: "G9-49-2560", width: 5120, height: 1440, logicalWidth: 2560, logicalHeight: 720, ppi: 109, hiDPI: true),     // 2.0x (native HiDPI)
-
-    // 34" Ultrawide (3440x1440 native) - Fractional scaling options
-    "uw34-2752x1152": PresetConfig(name: "UW34-2752", width: 5504, height: 2304, logicalWidth: 2752, logicalHeight: 1152, ppi: 110, hiDPI: true),     // 1.25x
-    "uw34-2646x1108": PresetConfig(name: "UW34-2646", width: 5292, height: 2216, logicalWidth: 2646, logicalHeight: 1108, ppi: 110, hiDPI: true),     // 1.3x
-    "uw34-2293x960": PresetConfig(name: "UW34-2293", width: 4586, height: 1920, logicalWidth: 2293, logicalHeight: 960, ppi: 110, hiDPI: true),       // 1.5x (recommended)
-    "uw34-1966x823": PresetConfig(name: "UW34-1966", width: 3932, height: 1646, logicalWidth: 1966, logicalHeight: 823, ppi: 110, hiDPI: true),       // 1.75x
-    "uw34-1720x720": PresetConfig(name: "UW34-1720", width: 3440, height: 1440, logicalWidth: 1720, logicalHeight: 720, ppi: 110, hiDPI: true),       // 2.0x (native HiDPI)
-
-    // 38" Ultrawide (3840x1600 native) - Fractional scaling options
-    "uw38-3072x1280": PresetConfig(name: "UW38-3072", width: 6144, height: 2560, logicalWidth: 3072, logicalHeight: 1280, ppi: 110, hiDPI: true),     // 1.25x
-    "uw38-2954x1231": PresetConfig(name: "UW38-2954", width: 5908, height: 2462, logicalWidth: 2954, logicalHeight: 1231, ppi: 110, hiDPI: true),     // 1.3x
-    "uw38-2560x1067": PresetConfig(name: "UW38-2560", width: 5120, height: 2134, logicalWidth: 2560, logicalHeight: 1067, ppi: 110, hiDPI: true),     // 1.5x (recommended)
-    "uw38-2194x914": PresetConfig(name: "UW38-2194", width: 4388, height: 1828, logicalWidth: 2194, logicalHeight: 914, ppi: 110, hiDPI: true),       // 1.75x
-    "uw38-1920x800": PresetConfig(name: "UW38-1920", width: 3840, height: 1600, logicalWidth: 1920, logicalHeight: 800, ppi: 110, hiDPI: true),       // 2.0x (native HiDPI)
-
-    // 4K (3840x2160 native) - Fractional scaling options
-    "4k-3072x1728": PresetConfig(name: "4K-3072", width: 6144, height: 3456, logicalWidth: 3072, logicalHeight: 1728, ppi: 163, hiDPI: true),         // 1.25x
-    "4k-2954x1662": PresetConfig(name: "4K-2954", width: 5908, height: 3324, logicalWidth: 2954, logicalHeight: 1662, ppi: 163, hiDPI: true),         // 1.3x
-    "4k-2560x1440": PresetConfig(name: "4K-2560", width: 5120, height: 2880, logicalWidth: 2560, logicalHeight: 1440, ppi: 163, hiDPI: true),         // 1.5x (recommended)
-    "4k-2194x1234": PresetConfig(name: "4K-2194", width: 4388, height: 2468, logicalWidth: 2194, logicalHeight: 1234, ppi: 163, hiDPI: true),         // 1.75x
-    "4k-1920x1080": PresetConfig(name: "4K-1920", width: 3840, height: 2160, logicalWidth: 1920, logicalHeight: 1080, ppi: 163, hiDPI: true),         // 2.0x (native HiDPI)
-]
