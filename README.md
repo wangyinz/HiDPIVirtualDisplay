@@ -2,7 +2,7 @@
 
 This fork adds 8K UHD HiDPI presets, fixed-refresh/cursor compatibility,
 right-edge Dock repair, persistent physical HDR/color output, and guarded HDMI
-reconnection. Current local experimental build: **8.22** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
+reconnection. Current local experimental build: **8.23** (stable baseline: **8.8**), based on upstream 1.2.6. Build this fork from source
 below to get these changes; upstream installers contain the upstream version.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -55,6 +55,46 @@ Click the display icon in your menu bar, pick your monitor, pick a resolution pr
 ### Custom scale
 
 Every monitor submenu has a **Custom Scale...** option — it opens a slider for any factor between 1.1x and 2.0x. The resolution preview updates as you drag.
+
+### Restrict virtual display resolutions (build 8.23)
+
+**Settings → Restrict Virtual Display Resolutions** exposes only the currently
+selected preset's logical size, backing pixels and refresh rate. Change the
+resolution through G9 Helper's preset/custom-scale menu. Turning this option
+off recreates the source with the legacy compatibility-mode behavior.
+
+A one-item `CGVirtualDisplaySettings.modes` array is not exclusive: macOS still
+adds compatibility modes, including 960×540 HiDPI. PowerPoint's slide-show
+configuration selected that mode on the tested setup even though the physical
+TV subsequently returned to 8K60 HDR. The tiny logical desktop was enlarged
+across the full TV.
+
+The restricted provider uses runtime-checked `SLVirtualDisplay` classes with
+one identical native/preferred mode, no optional modes, and configuration
+option bit 9. On macOS 26.6.2 this makes WindowServer use the explicit mode list
+instead of generating compatibility modes. This private option was located in
+the system implementation and verified on isolated test displays before use.
+There is no periodic resolution override racing with PowerPoint.
+
+The option defaults on when the required API classes/selectors are present.
+The actual source list, including hidden HiDPI modes, must contain exactly the
+requested mode before and after initial mirroring. A failed restricted setup
+does not silently substitute an unrestricted source; the compatibility option
+is available in Settings. The existing bounded recovery remains in effect.
+Mode construction is shared by all presets, custom sizes, and 1×/2× rendering;
+physical timing, HDR/color restoration and source cadence remain independent.
+
+Validation: 80 local value-object checks, all existing reconnect/render/output
+suites, universal build/signing, and live deployment passed. The installed
+4800×2700 HiDPI source exposes exactly one 9600×5400-backed mode at 90Hz, with
+physical 8K60 HDR RGB full-range 12-bit. During the user's PowerPoint tests,
+PowerPoint's own configuration readbacks retained 4800×2700. The user confirmed
+normal desktop size after exiting and normal full-screen **Slide Show**.
+**Presenter View** still attempts a separate presenter/audience arrangement;
+with this mirrored single-desktop setup, the user saw the presenter interface
+until switching to Slide Show. This change does not alter PowerPoint's view
+preferences or make that layout into two independent desktops. Other macOS
+releases and physical monitor combinations have not all been hardware-tested.
 
 ### Virtual rendering density (build 8.18)
 

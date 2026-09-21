@@ -41,6 +41,14 @@ BOOL VDMApplyVirtualCompositionBudget(id settings, double milliseconds,
 @property (nonatomic, readonly) double appliedCompositionBudgetMilliseconds;
 - (BOOL)supportsCompositionBudget;
 
+/// Expose only the requested source mode on supported macOS versions.
+/// No compatibility fallback is substituted if this policy cannot be applied.
+@property (nonatomic) BOOL restrictVirtualDisplayModes;
+@property (nonatomic, readonly) BOOL restrictedVirtualModesActive;
+- (BOOL)supportsRestrictedVirtualModes;
+- (BOOL)verifyRestrictedModesWithWidth:(unsigned)width height:(unsigned)height
+                                hiDPI:(BOOL)hiDPI atRate:(double)rate;
+
 /// Create a virtual display with specified parameters
 /// @param width Width in pixels
 /// @param height Height in pixels

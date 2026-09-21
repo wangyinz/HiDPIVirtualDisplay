@@ -2261,6 +2261,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         autoApplyItem.state = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey) ? .on : .off
         settingsMenu.addItem(autoApplyItem)
 
+        let restrictedItem = NSMenuItem(title: "Restrict Virtual Display Resolutions", action: #selector(toggleRestrictedVirtualModes(_:)), keyEquivalent: "")
+        restrictedItem.target = self
+        restrictedItem.state = restrictVirtualDisplayModes ? .on : .off
+        restrictedItem.toolTip = "Expose only the selected preset. Turn off for legacy compatibility. Changing this recreates the virtual display."
+        settingsMenu.addItem(restrictedItem)
+
         let retainItem = NSMenuItem(title: "Keep Virtual Display During HDMI Switch", action: #selector(toggleRetainedDisplay(_:)), keyEquivalent: "")
         retainItem.target = self
         retainItem.state = UserDefaults.standard.bool(forKey: kRetainVirtualOnDisconnectKey) ? .on : .off
@@ -2824,6 +2830,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = setMainDisplay(anchor)
     }
 
+    private let kRestrictedVirtualModesKey = "restrictVirtualDisplayModes"
+    private var restrictVirtualDisplayModes: Bool {
+        (UserDefaults.standard.object(forKey: kRestrictedVirtualModesKey) as? Bool)
+            ?? VirtualDisplayManager.shared().supportsRestrictedVirtualModes()
+    }
+
+    @objc private func toggleRestrictedVirtualModes(_ sender: NSMenuItem) {
+        guard !isSettingUp, !isRestarting else { return }
+        captureHDRBeforeTeardown()
+        UserDefaults.standard.set(!restrictVirtualDisplayModes, forKey: kRestrictedVirtualModesKey)
+        UserDefaults.standard.set(0, forKey: kConnectionRecoveryCountKey)
+        UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
+        if isActive || hasOrphanedVirtualDisplay() {
+            isRestarting = true
+            StatusWindowController.shared.show(message: "Applying virtual display modes…")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in relaunchApp() }
+        } else { rebuildMenu() }
+    }
+
     private var virtualRenderScale: VirtualRenderScale {
         VirtualRenderScale.preference(UserDefaults.standard.integer(forKey: VirtualRenderScale.preferenceKey))
     }
@@ -3264,6 +3289,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let manager = VirtualDisplayManager.shared()
         let savedBudget = UserDefaults.standard.double(forKey: kCompositionBudgetKey)
         manager.compositionBudgetMilliseconds = [0.0, 4.0, 8.0].contains(savedBudget) ? savedBudget : 0
+        manager.restrictVirtualDisplayModes = restrictVirtualDisplayModes
         debugLog("Calling createVirtualDisplay (matching display \(externalID))...")
         let virtualID = manager.createVirtualDisplay(
             withWidth: config.width,
@@ -3279,7 +3305,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if virtualID == 0 || virtualID == UInt32.max {
             debugLog("ERROR: Failed to create virtual display (returned \(virtualID))")
             isSettingUp = false  // Clear setup flag so reconnect detection works
-            StatusWindowController.shared.updateStatus("Failed to create virtual display")
+            StatusWindowController.shared.updateStatus(restrictVirtualDisplayModes
+                ? "Restricted modes unavailable. Disable Restrict Virtual Display Resolutions to use compatibility modes."
+                : "Failed to create virtual display")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                 StatusWindowController.shared.hide()
             }
@@ -3354,6 +3382,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard selectSourceMode(virtualID, config: config, rate: sourceRefreshRate(for: requirement)) else {
+            recoverFromSourceMismatch(config: config)
+            return
+        }
+        if manager.restrictedVirtualModesActive && !manager.verifyRestrictedModes(
+            withWidth: config.width, height: config.height, hiDPI: config.hiDPI,
+            atRate: sourceRefreshRate(for: requirement)) {
+            debugLog("Restricted mode list did not match the requested preset; refusing to mirror")
             recoverFromSourceMismatch(config: config)
             return
         }
@@ -3438,6 +3473,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let mode = CGDisplayCopyDisplayMode(currentVirtualID) else { return }
         let matches = config.matchesSource(width: mode.width, height: mode.height,
             pixelWidth: mode.pixelWidth, pixelHeight: mode.pixelHeight)
+        let manager = VirtualDisplayManager.shared()
+        if manager.restrictedVirtualModesActive, let requirement = setupTimingRequirement,
+           !manager.verifyRestrictedModes(withWidth: config.width, height: config.height,
+                hiDPI: config.hiDPI, atRate: sourceRefreshRate(for: requirement)) {
+            recoverFromSourceMismatch(config: config)
+            return
+        }
         let scale = mode.width > 0 ? Double(mode.pixelWidth) / Double(mode.width) : 0
         debugLog("Source verification: \(mode.width)x\(mode.height), pixels \(mode.pixelWidth)x\(mode.pixelHeight), scale=\(scale), requested match=\(matches)")
         let label = matches ? (config.hiDPI ? "HiDPI 2×" : "Standard 1×") : "unexpected render size"

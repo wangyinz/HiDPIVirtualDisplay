@@ -4,6 +4,7 @@
 
 #import "VirtualDisplayManager.h"
 #import "CGVirtualDisplayPrivate.h"
+#import "RestrictedVirtualDisplayPrivate.h"
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #import <IOKit/IOKitLib.h>
@@ -26,6 +27,9 @@ static id _windowObserver = nil;
 
 @interface VirtualDisplayManager () {
     CGVirtualDisplay *_display;
+    SLVirtualDisplay *_restrictedDisplay;
+    SLVirtualDisplayConfiguration *_restrictedConfiguration;
+    SLVirtualDisplaySettings *_restrictedSettings;
     CGVirtualDisplayDescriptor *_descriptor;
     CGVirtualDisplaySettings *_settings;
     CGVirtualDisplayMode *_mode;
@@ -71,6 +75,76 @@ BOOL VDMApplyVirtualCompositionBudget(id settings, double milliseconds,
         @catch (NSException *ignored) { }
         return NO;
     }
+}
+
+
+// macOS 26.6.2: configuration options bit 9 routes WindowServer's mode
+// generator through the explicit SLVirtualDisplaySettings list instead of
+// generating compatibility modes. Derived from the local implementation and
+// verified by external CGDisplayCopyAllDisplayModes reads on isolated displays.
+// A one-item CGVirtualDisplaySettings.modes array alone does NOT enforce this.
+static const NSUInteger VDMExplicitVirtualModesOption = 1UL << 9;
+
+static BOOL VDMRestrictedProviderAvailable(void) {
+    if (!VDMSkyLightHandle()) return NO;
+    Class config = NSClassFromString(@"SLVirtualDisplayConfiguration");
+    Class mode = NSClassFromString(@"SLVirtualDisplayMode");
+    Class settings = NSClassFromString(@"SLVirtualDisplaySettings");
+    Class display = NSClassFromString(@"SLVirtualDisplay");
+    return [config instancesRespondToSelector:@selector(initWithName:vendorID:productID:serialNumber:sizeInMillimeters:maximumSizeInPixels:chromaticities:error:)] &&
+        [config instancesRespondToSelector:@selector(setOptions:)] &&
+        [mode instancesRespondToSelector:@selector(initWithSizeInPixels:sizeInPoints:refreshRate:error:)] &&
+        [settings instancesRespondToSelector:@selector(initWithNativeMode:preferredMode:optionalModes:rotations:error:)] &&
+        [display instancesRespondToSelector:@selector(initWithConfiguration:error:)] &&
+        [display instancesRespondToSelector:@selector(applySettings:error:)] &&
+        [display instancesRespondToSelector:@selector(displayID)] &&
+        [display instancesRespondToSelector:@selector(destroy)];
+}
+
+// These two Create helpers only construct local value objects. They are also
+// exercised in unit tests; they do not register a display with WindowServer.
+static SLVirtualDisplaySettings *VDMCreateRestrictedSettings(unsigned width, unsigned height,
+    BOOL hiDPI, double rate, double budgetMS, double *appliedBudget) {
+    if (appliedBudget) *appliedBudget = 0;
+    if (!VDMRestrictedProviderAvailable() || width < 64 || height < 64 ||
+        width > 16384 || height > 16384 || !isfinite(rate) || rate < 24 || rate > 1000 ||
+        (hiDPI && (width % 2 || height % 2))) return nil;
+    unsigned factor = hiDPI ? 2 : 1;
+    NSError *error = nil;
+    SLVirtualDisplayMode *mode = [[NSClassFromString(@"SLVirtualDisplayMode") alloc]
+        initWithSizeInPixels:(VDMVirtualSize){width, height}
+        sizeInPoints:(VDMVirtualSize){width / factor, height / factor}
+        refreshRate:(float)rate error:&error];
+    if (!mode) { NSLog(@"VDM: Restricted mode rejected: %@", error); return nil; }
+    if (!VDMApplyVirtualCompositionBudget(mode, budgetMS, rate, appliedBudget)) {
+        [mode release];
+        mode = [[NSClassFromString(@"SLVirtualDisplayMode") alloc]
+            initWithSizeInPixels:(VDMVirtualSize){width, height}
+            sizeInPoints:(VDMVirtualSize){width / factor, height / factor}
+            refreshRate:(float)rate error:&error];
+        if (appliedBudget) *appliedBudget = 0;
+    }
+    if (!mode) return nil;
+    SLVirtualDisplaySettings *settings = [[NSClassFromString(@"SLVirtualDisplaySettings") alloc]
+        initWithNativeMode:mode preferredMode:mode optionalModes:@[] rotations:0 error:&error];
+    [mode release];
+    if (!settings) NSLog(@"VDM: Restricted settings rejected: %@", error);
+    return settings;
+}
+
+static SLVirtualDisplayConfiguration *VDMCreateRestrictedConfiguration(unsigned width, unsigned height,
+    unsigned ppi, NSString *name, CGPoint white, CGPoint red, CGPoint green, CGPoint blue) {
+    if (!VDMRestrictedProviderAvailable() || !width || !height || !ppi || !name.length) return nil;
+    VDMVirtualChromaticities colors = {{red.x, red.y}, {green.x, green.y},
+                                      {blue.x, blue.y}, {white.x, white.y}};
+    NSError *error = nil;
+    SLVirtualDisplayConfiguration *configuration = [[NSClassFromString(@"SLVirtualDisplayConfiguration") alloc]
+        initWithName:name vendorID:0x1234 productID:0x5678 serialNumber:0x4731
+        sizeInMillimeters:(VDMVirtualPoint){(float)width / ppi * 25.4f, (float)height / ppi * 25.4f}
+        maximumSizeInPixels:(VDMVirtualSize){width, height} chromaticities:colors error:&error];
+    configuration.options = VDMExplicitVirtualModesOption;
+    if (!configuration) NSLog(@"VDM: Restricted descriptor rejected: %@", error);
+    return configuration;
 }
 
 @implementation VirtualDisplayManager
@@ -165,6 +239,30 @@ static void retainWindowIfNeeded(NSWindow *window) {
     return self;
 }
 
+- (BOOL)supportsRestrictedVirtualModes { return VDMRestrictedProviderAvailable(); }
+
+- (BOOL)restrictedVirtualModesActive { return _restrictedDisplay != nil; }
+
+- (BOOL)verifyRestrictedModesWithWidth:(unsigned)width height:(unsigned)height
+                                hiDPI:(BOOL)hiDPI atRate:(double)rate {
+    if (!_restrictedDisplay || _currentDisplayID == 0) return NO;
+    NSDictionary *options = @{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES};
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(_currentDisplayID, (__bridge CFDictionaryRef)options);
+    BOOL verified = modes && CFArrayGetCount(modes) == 1;
+    if (verified) {
+        CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, 0);
+        unsigned factor = hiDPI ? 2 : 1;
+        verified = CGDisplayModeGetWidth(mode) == width / factor &&
+            CGDisplayModeGetHeight(mode) == height / factor &&
+            CGDisplayModeGetPixelWidth(mode) == width && CGDisplayModeGetPixelHeight(mode) == height &&
+            fabs(CGDisplayModeGetRefreshRate(mode) - rate) <= 0.5;
+    }
+    NSLog(@"VDM: Restricted mode-list verification: source=%u count=%ld verified=%d",
+        _currentDisplayID, modes ? (long)CFArrayGetCount(modes) : 0, verified);
+    if (modes) CFRelease(modes);
+    return verified;
+}
+
 - (BOOL)supportsCompositionBudget {
     Class settings = NSClassFromString(@"CGVirtualDisplaySettings");
     return [settings instancesRespondToSelector:@selector(setRefreshDeadline:)] &&
@@ -203,6 +301,34 @@ static void retainWindowIfNeeded(NSWindow *window) {
     [self releaseDisplayObjects];
 
     @try {
+        if (self.restrictVirtualDisplayModes) {
+            double appliedBudgetSeconds = 0;
+            _restrictedSettings = VDMCreateRestrictedSettings(width, height, hiDPI, refreshRate,
+                self.compositionBudgetMilliseconds, &appliedBudgetSeconds);
+            _appliedCompositionBudgetMilliseconds = appliedBudgetSeconds * 1000;
+            _restrictedConfiguration = VDMCreateRestrictedConfiguration(width, height, ppi, name,
+                whitePoint, redPrimary, greenPrimary, bluePrimary);
+            if (!_restrictedSettings || !_restrictedConfiguration) {
+                NSLog(@"VDM: Restricted modes unavailable; no unrestricted display will be substituted");
+                [self releaseDisplayObjects];
+                return kCGNullDirectDisplay;
+            }
+            NSError *error = nil;
+            _restrictedDisplay = [[NSClassFromString(@"SLVirtualDisplay") alloc]
+                initWithConfiguration:_restrictedConfiguration error:&error];
+            if (!_restrictedDisplay || ![_restrictedDisplay applySettings:_restrictedSettings error:&error] ||
+                _restrictedDisplay.displayID == kCGNullDirectDisplay) {
+                NSLog(@"VDM: Restricted display failed: %@", error);
+                [self releaseDisplayObjects];
+                return kCGNullDirectDisplay;
+            }
+            _currentDisplayID = _restrictedDisplay.displayID;
+            _displayName = [name copy];
+            NSLog(@"VDM: Restricted source %u: one explicit %ux%u / %ux%u mode at %.3f Hz",
+                _currentDisplayID, hiDPI ? width / 2 : width, hiDPI ? height / 2 : height,
+                width, height, refreshRate);
+            return _currentDisplayID;
+        }
         // alloc/init already returns an owned (+1) reference; the extra
         // retains this code used to add meant releaseDisplayObjects never
         // dropped the refcount to zero, so the CGVirtualDisplay never
@@ -802,6 +928,15 @@ static BOOL VDMDockRepairApplies(CGDirectDisplayID source, CGDirectDisplayID tar
 
 - (void)releaseDisplayObjects {
     NSLog(@"VDM: Releasing display objects...");
+
+    // Explicitly destroy the alternate provider before releasing its value objects.
+    if (_restrictedDisplay) {
+        [_restrictedDisplay destroy];
+        [_restrictedDisplay release];
+        _restrictedDisplay = nil;
+    }
+    [_restrictedSettings release]; _restrictedSettings = nil;
+    [_restrictedConfiguration release]; _restrictedConfiguration = nil;
 
     // Release in reverse order of creation
     if (_display) {
